@@ -1,0 +1,872 @@
+# src/report_generator.py
+
+import os
+import json
+import time
+import re
+import logging
+from datetime import datetime
+from typing import List, Dict, Optional, Callable
+from dataclasses import dataclass
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import google.generativeai as genai
+import requests
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, KeepTogether
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.lib import colors
+from reportlab.platypus import Table, TableStyle
+
+logger = logging.getLogger(__name__)
+
+
+# -----------------------------
+# DATA STRUCTURES
+# -----------------------------
+@dataclass
+class TextChunk:
+    text: str
+    meta: Optional[Dict] = None
+
+
+@dataclass
+class ReportSection:
+    section_id: str
+    title: str
+    content: str
+    word_count: int
+    generated_at: datetime
+
+
+# -----------------------------
+# GOOGLE SEARCH TOOL
+# -----------------------------
+class GoogleSearchTool:
+    def __init__(self):
+        self.api_key = os.getenv("GOOGLE_API_KEY")
+        self.cse_id = os.getenv("GOOGLE_CSE_ID")
+
+    def search(self, query: str, max_retries: int = 3) -> Dict:
+        if not self.api_key or not self.cse_id:
+            logger.warning("Google Search API credentials not found, skipping search")
+            return {"results": []}
+
+        params = {"key": self.api_key, "cx": self.cse_id, "q": query, "num": 3}
+
+        for attempt in range(max_retries + 1):
+            try:
+                time.sleep(0.5)
+                response = requests.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=10)
+
+                if response.status_code == 429:
+                    logger.warning(f"Rate limited. Retrying in 30s... (attempt {attempt+1})")
+                    time.sleep(30)
+                    continue
+
+                response.raise_for_status()
+                data = response.json()
+
+                if "error" in data:
+                    logger.error(f"Search API error: {data.get('error')}")
+                    return {"results": []}
+
+                results = [
+                    {"title": item.get("title", ""), "snippet": item.get("snippet", "")}
+                    for item in data.get("items", []) if item.get("snippet")
+                ]
+                return {"results": results}
+
+            except Exception as e:
+                logger.error(f"Search error: {e}")
+                if attempt < max_retries:
+                    time.sleep(30)
+
+        return {"results": []}
+
+
+# -----------------------------
+# CONTENT GENERATOR
+# -----------------------------
+class ContentGenerator:
+    SECTION_TITLES = {
+        "executive_summary": "1.0 Executive Summary",
+        "introduction": "2.0 Introduction",
+        "site_appreciation": "3.0 Site Appreciation",
+        "methodology": "4.0 Approach and Methodology",
+        "task_assignment": "5.0 Task Assignment and Manning Schedule",
+        "cross_sections": "6.0 Proposed Cross Sections",
+        "design_standards": "7.0 Draft Design Standards",
+        "work_programme": "8.0 Work Programme",
+        "development": "9.0 Development",
+        "quality_assurance": "10.0 Quality Assurance Plan",
+        "checklists": "11.0 Checklists",
+        "summary_conclusion": "12.0 Summary and Conclusion",
+        "compliances": "13.0 Compliances",
+        "appendix_irc_codes": "Appendix A: IRC Codes Reference",
+        "appendix_monsoon": "Appendix B: Monsoon Calendar",
+        "appendix_equipment": "Appendix C: Equipment Catalog",
+        "appendix_testing": "Appendix D: Testing Protocols",
+        "appendix_compliance_matrix": "Appendix E: Compliance Matrix"
+    }
+
+    SEARCH_QUERIES = {
+        "site_appreciation": [
+            "site details road project {location}",
+            "monsoon climate construction {location}",
+            "construction material suppliers {location}"
+        ],
+        "methodology": [
+            "IRC codes Indian Roads Congress",
+            "MoRTH specifications Ministry Road Transport Highways",
+            "NHAI guidelines National Highways Authority"
+        ],
+        "design_standards": [
+            "IRC codes standards",
+            "MoRTH specifications",
+            "BIS standards road construction"
+        ],
+        "compliances": [
+            "Indian construction labour laws Building Workers Act",
+            "construction site safety regulations India",
+            "environmental clearance highway {location}"
+        ],
+        "quality_assurance": [
+            "BIS road construction quality testing",
+            "MoRTH quality specifications"
+        ]
+    }
+
+    def __init__(self, location: str, progress_callback: Optional[Callable[[float], None]] = None):
+        """
+        Initialize content generator
+        
+        Args:
+            location: Project location string
+            progress_callback: Optional callback for progress updates (0-100)
+        """
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            raise ValueError("GOOGLE_API_KEY not found in environment variables")
+        
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel("gemini-2.5-flash")
+        self.location = location
+        self.search_tool = GoogleSearchTool()
+        self.progress_callback = progress_callback
+        
+        logger.info(f"ContentGenerator initialized for location: {location}")
+
+    def update_progress(self, value: float):
+        """Update progress via callback if available"""
+        if self.progress_callback:
+            try:
+                self.progress_callback(min(100.0, max(0.0, value)))
+            except Exception as e:
+                logger.warning(f"Progress callback error: {e}")
+
+    def _gather_context(self, category: str) -> str:
+        """Gather external context via Google Search"""
+        queries = self.SEARCH_QUERIES.get(category, [])
+        context = f"\n=== EXTERNAL RESEARCH CONTEXT FOR {self.location.upper()} ===\n"
+        
+        for query_template in queries:
+            query = query_template.format(location=self.location)
+            results = self.search_tool.search(query)
+            
+            if results.get("results"):
+                context += f"\nQuery: {query}\n"
+                for i, r in enumerate(results["results"][:2], 1):
+                    context += f"  {i}. {r.get('snippet', '')}\n"
+            else:
+                context += f"\nQuery: {query} → No results found.\n"
+        
+        context += "\n=== END EXTERNAL CONTEXT ===\n"
+        return context
+
+    def _get_section_prompt(self, category: str, chunks: List[TextChunk]) -> str:
+        """Build prompt for section generation"""
+        combined_chunks = "\n".join([c.text.strip() for c in chunks if c.text.strip()]) or "No specific project details were provided."
+        
+        base_guidelines = f"""
+**CRITICAL REQUIREMENTS:**
+- Write ONLY in professional English. NO regional languages.
+- Base ALL content on {self.location}, India.
+- Include technical specifications and tables where relevant.
+- Reference IRC, MoRTH, BIS, NHAI standards.
+- Do NOT invent project-specific facts unless provided.
+- Format content professionally with clear headings and structure.
+"""
+        
+        prompt = f"""Create detailed professional content for the '{category}' section of an RFP inception report.
+
+CLIENT INPUT:
+{combined_chunks}
+
+{base_guidelines}
+
+Generate comprehensive, technical content suitable for a professional engineering report."""
+        
+        return prompt
+
+    def _generate_with_retry(self, prompt: str, max_retries: int = 3) -> str:
+        """Generate content with retry logic for rate limits"""
+        for attempt in range(max_retries + 1):
+            try:
+                time.sleep(1.0)
+                response = self.model.generate_content(prompt)
+                return response.text.strip()
+            except Exception as e:
+                if "429" in str(e) or "rateLimit" in str(e):
+                    if attempt < max_retries:
+                        logger.warning(f"Rate limited. Retrying in 30s... (attempt {attempt+1})")
+                        time.sleep(30)
+                    else:
+                        logger.error("Max retries exceeded for rate limit")
+                        raise e
+                else:
+                    logger.error(f"Content generation error: {e}")
+                    raise e
+
+    def generate_section(self, category: str, chunks: List[TextChunk]) -> ReportSection:
+        """Generate a single report section"""
+        if not chunks:
+            chunks = [TextChunk(text="No input provided.")]
+        
+        logger.info(f"Generating section: {category}")
+        
+        external_context = self._gather_context(category)
+        base_prompt = self._get_section_prompt(category, chunks)
+        full_prompt = base_prompt + external_context
+        
+        content = self._generate_with_retry(full_prompt)
+
+        word_count = len(content.split())
+        logger.info(f"Generated '{category}' section: {word_count} words")
+        
+        return ReportSection(
+            section_id=category,
+            title=self.SECTION_TITLES.get(category, category.replace('_', ' ').title()),
+            content=content,
+            word_count=len(content.split()),
+            generated_at=datetime.now()
+        )
+
+    def generate_appendix(self, appendix_type: str) -> ReportSection:
+        """Generate appendix section"""
+        appendix_prompts = {
+            "appendix_irc_codes": f"List and summarize relevant IRC codes for road/highway projects in {self.location}, India. Include IRC:SP:84 for urban roads, IRC:37 for rural roads, IRC:5 for traffic standards.",
+            "appendix_monsoon": f"Create a detailed monsoon calendar for {self.location}, India. Include typical rainfall patterns, construction-suitable months, and weather considerations.",
+            "appendix_equipment": f"List comprehensive equipment catalog for road construction projects in {self.location}, India. Include machinery specifications, capacity, and usage.",
+            "appendix_testing": f"Describe material testing protocols following MoRTH specifications for road projects in {self.location}, India. Include soil testing, aggregate testing, and quality control measures.",
+            "appendix_compliance_matrix": f"Create compliance matrix showing adherence to IRC, MoRTH, BIS, and NHAI standards for projects in {self.location}, India."
+        }
+        
+        prompt = appendix_prompts.get(appendix_type, f"Create {appendix_type} for {self.location}")
+        logger.info(f"Generating appendix: {appendix_type}")
+        
+        content = self._generate_with_retry(prompt)
+
+        word_count = len(content.split())
+        logger.info(f"Generated '{appendix_type}' appendix: {word_count} words")
+        
+        return ReportSection(
+            section_id=appendix_type,
+            title=self.SECTION_TITLES.get(appendix_type, appendix_type.replace('_', ' ').title()),
+            content=content,
+            word_count=len(content.split()),
+            generated_at=datetime.now()
+        )
+
+
+# -----------------------------
+# PDF UTILITIES
+# -----------------------------
+def sanitize_for_reportlab(text: str) -> str:
+    """Sanitize text for ReportLab PDF generation"""
+    # Convert <br> tags to newlines BEFORE processing
+    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
+
+    # Remove markdown headers (# ## ###)
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    
+    # Convert markdown bold to HTML bold
+    text = re.sub(r'\*\*([^*]+?)\*\*', r'<b>\1</b>', text)
+    
+    # Convert markdown italic to HTML italic (single asterisk)
+    text = re.sub(r'(?<!\*)\*(?!\*)([^*]+?)(?<!\*)\*(?!\*)', r'<i>\1</i>', text)
+    
+    # Escape ALL special characters first
+    text = text.replace('&', '&amp;')
+    text = text.replace('<', '&lt;')
+    text = text.replace('>', '&gt;')
+    
+    # Now restore ONLY the safe tags that ReportLab supports
+    text = text.replace('&lt;b&gt;', '<b>').replace('&lt;/b&gt;', '</b>')
+    text = text.replace('&lt;i&gt;', '<i>').replace('&lt;/i&gt;', '</i>')
+    text = text.replace('&lt;u&gt;', '<u>').replace('&lt;/u&gt;', '</u>')
+    text = text.replace('&lt;strong&gt;', '<b>').replace('&lt;/strong&gt;', '</b>')
+    text = text.replace('&lt;em&gt;', '<i>').replace('&lt;/em&gt;', '</i>')
+    
+    return text.strip()
+
+
+def parse_markdown_table(text: str) -> tuple:
+    """
+    Parse markdown table from text with validation
+    Returns: (is_table, table_data) where table_data is list of lists
+    """
+    lines = text.strip().split('\n')
+    
+    # Check if it looks like a markdown table
+    if not lines or not lines[0].startswith('|'):
+        return False, None
+    
+    table_data = []
+    for i, line in enumerate(lines):
+        line = line.strip()
+        if not line.startswith('|') or not line.endswith('|'):
+            continue
+        
+        # Skip separator line (contains dashes and colons)
+        if re.match(r'^\|[\s\-:|]+\|$', line):
+            continue
+        
+        # Parse cells
+        cells = [cell.strip() for cell in line.split('|')[1:-1]]
+        
+        # Skip completely empty rows
+        if cells and any(cell.strip() for cell in cells):
+            # Clean markdown from cells
+            cleaned_cells = []
+            for cell in cells:
+                # Remove markdown formatting
+                cell = re.sub(r'\*\*(.+?)\*\*', r'\1', cell)  # Bold
+                cell = re.sub(r'\*(.+?)\*', r'\1', cell)      # Italic
+                cell = re.sub(r'`(.+?)`', r'\1', cell)        # Code
+                cell = re.sub(r'<[^>]+>', '', cell)           # HTML tags
+                cell = re.sub(r'^#{1,6}\s+', '', cell)        # Headers
+                
+                # Truncate very long cells
+                if len(cell) > 150:
+                    cell = cell[:147] + '...'
+                
+                cleaned_cells.append(cell)
+            
+            table_data.append(cleaned_cells)
+    
+    # Validate: must have at least header + 1 data row
+    if len(table_data) < 2:
+        return False, None
+    
+    # Normalize: ensure all rows have same column count
+    if table_data:
+        col_count = len(table_data[0])
+        normalized_data = []
+        for row in table_data:
+            if len(row) < col_count:
+                # Pad with empty cells
+                row.extend([''] * (col_count - len(row)))
+            elif len(row) > col_count:
+                # Trim extra cells
+                row = row[:col_count]
+            normalized_data.append(row)
+        table_data = normalized_data
+    
+    return len(table_data) > 0, table_data
+
+def extract_subsections(content: str) -> List[str]:
+    """Extract subsection titles from content"""
+    subsections = []
+    lines = content.split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Pattern 1: Numbered subsections (3.1, 3.1.1, etc.)
+        match = re.match(r'^(\d+\.)+\d+\s+(.+)', line)
+        if match:
+            subsections.append(line)
+            continue
+        
+        # Pattern 2: Bold text that looks like a header
+        if re.match(r'^\*\*[^*]+\*\*$', line) or re.match(r'^<b>[^<]+</b>$', line):
+            clean = re.sub(r'\*\*([^*]+)\*\*', r'\1', line)
+            clean = re.sub(r'</?b>', '', clean)
+            if len(clean.split()) <= 10:
+                subsections.append(clean)
+            continue
+        
+        # Pattern 3: Markdown headers (##, ###)
+        if re.match(r'^#{2,6}\s+', line):
+            clean = re.sub(r'^#{2,6}\s+', '', line)
+            subsections.append(clean)
+    
+    return subsections
+
+def strip_leading_numbering(text: str) -> str:
+    """
+    Remove leading numbering patterns, even when wrapped in markdown formatting.
+    """
+    # Remove leading numbering patterns that might be after markdown formatting
+    # Pattern for markdown bold followed by numbering
+    patterns = [
+        r'^\s*(\*\*)?\s*(?:\d+(?:\.\d+)*\.?|\(\d+\)|\d+\)|[IVXLCDM]+\.?|\([IVXLCDM]+\)|[IVXLCDM]+\)|[A-Z]\.|\([A-Z]\)|[A-Z]\)|[\*\•]\s*)\s*(\*\*)?',
+        r'^\s*\*\*\s*(?:\d+(?:\.\d+)*\.?|\(\d+\)|\d+\)|[IVXLCDM]+\.?|\([IVXLCDM]+\)|[IVXLCDM]+\)|[A-Z]\.|\([A-Z]\)|[A-Z]\)|[\*\•]\s*)\s*\*\*'
+    ]
+    
+    for pattern in patterns:
+        text = re.sub(pattern, '', text)
+    
+    # Also handle the case where numbering is at the very beginning
+    basic_pattern = r'^\s*(?:\d+(?:\.\d+)*\.?|\(\d+\)|\d+\)|[IVXLCDM]+\.?|\([IVXLCDM]+\)|[IVXLCDM]+\)|[A-Z]\.|\([A-Z]\)|[A-Z]\)|[\*\•]\s*)\s*'
+    text = re.sub(basic_pattern, '', text)
+    
+    # Remove trailing colons and asterisks
+    text = re.sub(r'[:*]+$', '', text.strip())
+    
+    return text.strip()
+
+
+def create_pdf_report(sections: List[ReportSection], location: str, output_path: str):
+    """Create PDF report from sections with improved formatting"""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    doc = SimpleDocTemplate(
+        str(output_path),
+        pagesize=A4,
+        rightMargin=72,
+        leftMargin=72,
+        topMargin=72,
+        bottomMargin=72
+    )
+    
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        'Title', 
+        parent=styles['Heading1'], 
+        fontSize=18, 
+        spaceAfter=30, 
+        alignment=1,
+        textColor=colors.HexColor('#1a1a1a')
+    )
+    heading_style = ParagraphStyle(
+        'Heading', 
+        parent=styles['Heading2'], 
+        fontSize=14, 
+        spaceAfter=12, 
+        spaceBefore=12, 
+        keepWithNext=True,
+        textColor=colors.HexColor('#2c3e50'),
+        fontName='Helvetica-Bold'
+    )
+    body_style = ParagraphStyle(
+        'Body', 
+        parent=styles['BodyText'], 
+        fontSize=11, 
+        leading=16, 
+        spaceAfter=8,
+        textColor=colors.HexColor('#2c3e50'),
+        alignment=0
+    )
+    
+    # Style for table cells with word wrapping
+    table_cell_style = ParagraphStyle(
+        'TableCell',
+        parent=styles['BodyText'],
+        fontSize=9,
+        leading=12,
+        alignment=0,
+        wordWrap='CJK'
+    )
+    
+    story = []
+
+    # Cover page
+    story.append(Paragraph("INCEPTION REPORT", title_style))
+    story.append(Spacer(1, 100))
+    story.append(Paragraph(f"Road/Highway/Bridge Project", heading_style))
+    story.append(Spacer(1, 20))
+    story.append(Paragraph(f"<b>Location: {location}, India</b>", body_style))
+    story.append(Spacer(1, 50))
+    story.append(Paragraph(f"Generated on: {datetime.now().strftime('%d %B %Y')}", body_style))
+    story.append(PageBreak())
+
+    # Table of Contents
+    story.append(Paragraph("Table of Contents", heading_style))
+    story.append(Spacer(1, 20))
+    
+    # TOC subsection style
+    toc_sub_style = ParagraphStyle(
+        'TOCSub',
+        parent=styles['BodyText'],
+        fontSize=10,
+        leading=14,
+        leftIndent=20,
+        spaceBefore=2,
+        spaceAfter=2,
+        textColor=colors.HexColor('#555555')
+    )
+    
+    for sec in sections:
+        clean_title = strip_leading_numbering(sec.title)
+        story.append(Paragraph(f"<b>• {clean_title}</b>", body_style))
+        
+        subsections = extract_subsections(sec.content)
+        for subsection in subsections[1:]:
+            clean_sub = strip_leading_numbering(subsection.strip())
+            story.append(Paragraph(f"  ◦ {clean_sub}", toc_sub_style))
+        
+        story.append(Spacer(1, 6))
+    
+    story.append(PageBreak())
+
+    # Sections with improved formatting
+    for section in sections:
+        # Section title
+        story.append(Paragraph(section.title, heading_style))
+        story.append(Spacer(1, 12))
+        
+        # Split content by double newlines (paragraphs)
+        paragraphs = section.content.split('\n\n')
+        
+        for para in paragraphs:
+            para = para.strip()
+            if not para:
+                continue
+            
+            # Check if it's a table
+            is_table, table_data = parse_markdown_table(para)
+            
+            if is_table and table_data and len(table_data) >= 2:
+                # Create table with proper wrapping
+                try:
+                    # Calculate available width
+                    available_width = 6.5 * inch
+                    num_cols = len(table_data[0])
+                    col_widths = [available_width / num_cols] * num_cols
+                    
+                    # Wrap each cell in a Paragraph for text wrapping
+                    wrapped_table_data = []
+                    for row_idx, row in enumerate(table_data):
+                        wrapped_row = []
+                        for cell in row:
+                            if row_idx == 0:  # Header row
+                                wrapped_row.append(Paragraph(f"<b>{cell}</b>", table_cell_style))
+                            else:
+                                wrapped_row.append(Paragraph(cell, table_cell_style))
+                        wrapped_table_data.append(wrapped_row)
+                    
+                    # Create table with style
+                    table = Table(wrapped_table_data, colWidths=col_widths, repeatRows=1)
+                    table.setStyle(TableStyle([
+                        # Header row
+                        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3498db')),
+                        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                        ('FONTSIZE', (0, 0), (-1, 0), 10),
+                        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                        ('TOPPADDING', (0, 0), (-1, 0), 12),
+                        
+                        # Data rows
+                        ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+                        ('TEXTCOLOR', (0, 1), (-1, -1), colors.black),
+                        ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                        ('FONTSIZE', (0, 1), (-1, -1), 9),
+                        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                        
+                        # Grid
+                        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                        ('LINEBELOW', (0, 0), (-1, 0), 2, colors.HexColor('#2980b9')),
+                        
+                        # Padding
+                        ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                        ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+                        ('TOPPADDING', (0, 1), (-1, -1), 8),
+                        ('BOTTOMPADDING', (0, 1), (-1, -1), 8),
+                    ]))
+                    
+                    story.append(table)
+                    story.append(Spacer(1, 12))
+                except Exception as e:
+                    logger.warning(f"Failed to render table: {e}")
+                    # Fallback: render as text
+                    for line in para.split('\n'):
+                        if line.strip() and not re.match(r'^\|[\s\-:|]+\|$', line):
+                            story.append(Paragraph(sanitize_for_reportlab(line), body_style))
+            
+            # Check if it's a bullet list
+            elif para.startswith(('- ', '• ', '* ')):
+                lines = para.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if line.startswith(('- ', '• ', '* ')):
+                        line = re.sub(r'^[-•*]\s+', '', line)
+                        story.append(Paragraph(f"• {sanitize_for_reportlab(line)}", body_style))
+                    elif line:
+                        story.append(Paragraph(f"  {sanitize_for_reportlab(line)}", body_style))
+                story.append(Spacer(1, 6))
+            
+            # Check if it's a numbered list
+            elif re.match(r'^\d+\.', para):
+                lines = para.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if re.match(r'^\d+\.', line):
+                        story.append(Paragraph(sanitize_for_reportlab(line), body_style))
+                    elif line:
+                        story.append(Paragraph(f"  {sanitize_for_reportlab(line)}", body_style))
+                story.append(Spacer(1, 6))
+            
+            # Regular paragraph
+            else:
+                for line in para.split('\n'):
+                    line = line.strip()
+                    if line:
+                        story.append(Paragraph(sanitize_for_reportlab(line), body_style))
+                        story.append(Spacer(1, 4))
+        
+        story.append(Spacer(1, 24))
+        story.append(PageBreak())
+
+    try:
+        doc.build(story)
+        logger.info(f"PDF report created: {output_path}")
+    except Exception as e:
+        logger.error(f"Failed to build PDF: {e}")
+        raise
+# -----------------------------
+# LOCATION EXTRACTION
+# -----------------------------
+def extract_location(input_file: str) -> str:
+    """Extract location from OCR using LLM"""
+    try:
+        with open(input_file, "r", encoding="utf-8") as f:
+            sample_text = f.read()[:5000]
+        
+        if not sample_text.strip():
+            return "Unspecified location in India"
+    except Exception as e:
+        logger.error(f"Failed to read OCR file: {e}")
+        return "Unspecified location in India"
+
+    genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    
+    prompt = f"""Extract ONLY the primary city/place from the text for a road/highway/bridge project in India.
+
+Text:
+{sample_text}
+
+Respond with just the location name, nothing else.
+Location:"""
+    
+    try:
+        location = model.generate_content(prompt).text.strip()
+        if not location or len(location) < 3:
+            return "Unspecified location in India"
+        return location
+    except Exception as e:
+        logger.error(f"Location extraction failed: {e}")
+        return "Unspecified location in India"
+
+
+def enhance_location(location: str) -> str:
+    """Enhance location details using search"""
+    if location == "Unspecified location in India":
+        return location
+
+    logger.info(f"Enhancing location: {location}")
+    search_tool = GoogleSearchTool()
+    results = search_tool.search(f"{location} district state India location details")
+    context = "\n".join([r.get("snippet", "") for r in results.get("results", [])[:3]])
+
+    genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    
+    prompt = f"""Enhance location into format 'City, District, State' for India.
+
+Original: {location}
+
+Search Results:
+{context}
+
+Respond with just the enhanced location in format: City, District, State
+Enhanced Location:"""
+    
+    try:
+        enhanced = model.generate_content(prompt).text.strip()
+        if enhanced and "," in enhanced:
+            return enhanced
+        return location
+    except Exception as e:
+        logger.error(f"Location enhancement failed: {e}")
+        return location
+
+
+# -----------------------------
+# MAIN GENERATION FUNCTION
+# -----------------------------
+def generate_inception_report(
+    classified_file: str,
+    output_path: str,
+    ocr_file: Optional[str] = None,
+    session_id: Optional[str] = None,
+    progress_store: Optional[Dict[str, Dict[str, float]]] = None
+) -> bool:
+    """
+    Generate inception report PDF from classified data
+    
+    Args:
+        classified_file: Path to classified JSON file
+        output_path: Path to save PDF report
+        ocr_file: Optional path to OCR file for location extraction
+        session_id: Session identifier for progress tracking
+        progress_store: Optional progress dictionary to update
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        # Progress callback
+        def progress_callback(value: float):
+            if progress_store and session_id and session_id in progress_store:
+                progress_store[session_id]["report"] = value
+
+        progress_callback(5.0)
+
+        # Extract location
+        if ocr_file and Path(ocr_file).exists():
+            location = extract_location(ocr_file)
+            location = enhance_location(location)
+        else:
+            location = "Unspecified location in India"
+        
+        logger.info(f"Report location: {location}")
+        progress_callback(10.0)
+
+        # Load classified data
+        try:
+            with open(classified_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load classified file: {e}")
+            return False
+
+        # Parse categories from classified data
+        categories_data = data.get("categories", {})
+        categorized_chunks = {}
+        
+        for category, chunks in categories_data.items():
+            if isinstance(chunks, list):
+                categorized_chunks[category] = [
+                    TextChunk(text=chunk.get("text", "")) 
+                    for chunk in chunks if isinstance(chunk, dict)
+                ]
+        
+        progress_callback(15.0)
+
+        # Generate sections
+        generator = ContentGenerator(location, progress_callback=progress_callback)
+        
+        section_categories = [
+            "executive_summary", "introduction", "site_appreciation", "methodology",
+            "task_assignment", "cross_sections", "design_standards", "work_programme",
+            "development", "quality_assurance", "checklists", "summary_conclusion", "compliances"
+        ]
+        
+        sections = []
+        total_sections = len(section_categories) + 5  # +5 for appendices
+        
+        for idx, cat in enumerate(section_categories):
+            chunks = categorized_chunks.get(cat, [TextChunk(text="No input provided.")])
+            section = generator.generate_section(cat, chunks)
+            sections.append(section)
+            
+            # Update progress
+            progress = 15.0 + (idx + 1) / total_sections * 70.0
+            progress_callback(progress)
+
+        # Generate appendices
+        appendix_types = [
+            "appendix_irc_codes", "appendix_monsoon", "appendix_equipment",
+            "appendix_testing", "appendix_compliance_matrix"
+        ]
+        
+        for idx, appendix_type in enumerate(appendix_types):
+            appendix = generator.generate_appendix(appendix_type)
+            sections.append(appendix)
+            
+            # Update progress
+            progress = 85.0 + (idx + 1) / len(appendix_types) * 10.0
+            progress_callback(progress)
+
+        # Create PDF
+        progress_callback(95.0)
+        create_pdf_report(sections, location, output_path)
+        
+        # Mark complete
+        progress_callback(100.0)
+        logger.info(f"Inception report generated successfully: {output_path}")
+        
+        return True
+
+    except Exception as e:
+        logger.error(f"Report generation failed: {e}", exc_info=True)
+        return False
+    
+# Add this at the end of your report_generator.py file
+
+# if __name__ == "__main__":
+#     import sys
+    
+#     logging.basicConfig(
+#         level=logging.INFO,
+#         format='%(asctime)s - %(levelname)s - %(message)s'
+#     )
+    
+#     # Default files in current directory
+#     classified_file = "classified.json"
+#     ocr_file = "ocr_output.txt"
+#     output_file = "inception_report.pdf"
+    
+#     # Check if files exist
+#     if not Path(classified_file).exists():
+#         print(f"❌ Error: {classified_file} not found in current directory")
+#         sys.exit(1)
+    
+#     if not Path(ocr_file).exists():
+#         print(f"⚠️  Warning: {ocr_file} not found, will use default location")
+#         ocr_file = None
+    
+#     print(f"📄 Classified: {classified_file}")
+#     print(f"📝 OCR File:   {ocr_file if ocr_file else 'Not provided'}")
+#     print(f"📋 Output:     {output_file}")
+#     print()
+    
+#     start_time = time.time()
+    
+#     success = generate_inception_report(
+#         classified_file=classified_file,
+#         output_path=output_file,
+#         ocr_file=ocr_file,
+#         session_id=None,
+#         progress_store=None
+#     )
+    
+#     elapsed = time.time() - start_time
+    
+#     if success:
+#         print(f"\n✅ Report generated successfully in {elapsed:.1f}s")
+#         print(f"   Output saved to: {output_file}")
+#     else:
+#         print(f"\n❌ Report generation failed")
+#         sys.exit(1)

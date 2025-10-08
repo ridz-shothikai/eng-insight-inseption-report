@@ -1,0 +1,41 @@
+# Web Framework
+fastapi
+uvicorn[standard]
+python-multipart
+
+# Environment Management
+python-dotenv
+
+# PDF Processing
+PyPDF2
+pdfplumber
+
+# Google AI
+google-generativeai
+googlesearch-python
+google-search-results
+
+# Async File Operations
+aiofiles
+aiohttp
+
+# Data Processing
+python-dateutil
+
+# Document Generation (for final report assembly)
+reportlab
+python-docx
+
+# HTTP Client (for external data integration)
+httpx
+
+# Utilities
+pydantic
+pydantic-settings
+
+#ocr
+pdf2image
+Pillow
+opencv-python
+polyline
+

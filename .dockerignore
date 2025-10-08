@@ -1,0 +1,19 @@
+# Ignore Python cache and virtualenvs
+__pycache__/
+*.pyc
+*.pyo
+.Python
+env/
+venv/
+
+# Git and CI
+.git
+.github
+
+# Uploads and large files
+uploads/
+sample/
+
+# Editor files
+.vscode/
+*.swp
