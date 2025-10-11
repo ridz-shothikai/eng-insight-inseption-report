@@ -21,6 +21,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.lib import colors
 from reportlab.platypus import Table, TableStyle
+from reportlab.platypus import Image as RLImage
 
 logger = logging.getLogger(__name__)
 
@@ -142,13 +143,6 @@ class ContentGenerator:
     }
 
     def __init__(self, location: str, progress_callback: Optional[Callable[[float], None]] = None):
-        """
-        Initialize content generator
-        
-        Args:
-            location: Project location string
-            progress_callback: Optional callback for progress updates (0-100)
-        """
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
             raise ValueError("GOOGLE_API_KEY not found in environment variables")
@@ -158,11 +152,29 @@ class ContentGenerator:
         self.location = location
         self.search_tool = GoogleSearchTool()
         self.progress_callback = progress_callback
+
+        # self.safety_settings = [
+        #     {
+        #         "category": "HARM_CATEGORY_HARASSMENT",
+        #         "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+        #     },
+        #     {
+        #         "category": "HARM_CATEGORY_HATE_SPEECH", 
+        #         "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+        #     },
+        #     {
+        #         "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        #         "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+        #     },
+        #     {
+        #         "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+        #         "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+        #     },
+        # ]
         
         logger.info(f"ContentGenerator initialized for location: {location}")
 
     def update_progress(self, value: float):
-        """Update progress via callback if available"""
         if self.progress_callback:
             try:
                 self.progress_callback(min(100.0, max(0.0, value)))
@@ -170,7 +182,6 @@ class ContentGenerator:
                 logger.warning(f"Progress callback error: {e}")
 
     def _gather_context(self, category: str) -> str:
-        """Gather external context via Google Search"""
         queries = self.SEARCH_QUERIES.get(category, [])
         context = f"\n=== EXTERNAL RESEARCH CONTEXT FOR {self.location.upper()} ===\n"
         
@@ -189,7 +200,6 @@ class ContentGenerator:
         return context
 
     def _get_section_prompt(self, category: str, chunks: List[TextChunk]) -> str:
-        """Build prompt for section generation"""
         combined_chunks = "\n".join([c.text.strip() for c in chunks if c.text.strip()]) or "No specific project details were provided."
         
         base_guidelines = f"""
@@ -214,7 +224,6 @@ Generate comprehensive, technical content suitable for a professional engineerin
         return prompt
 
     def _generate_with_retry(self, prompt: str, max_retries: int = 3) -> str:
-        """Generate content with retry logic for rate limits"""
         for attempt in range(max_retries + 1):
             try:
                 time.sleep(1.0)
@@ -233,7 +242,6 @@ Generate comprehensive, technical content suitable for a professional engineerin
                     raise e
 
     def generate_section(self, category: str, chunks: List[TextChunk]) -> ReportSection:
-        """Generate a single report section"""
         if not chunks:
             chunks = [TextChunk(text="No input provided.")]
         
@@ -257,7 +265,6 @@ Generate comprehensive, technical content suitable for a professional engineerin
         )
 
     def generate_appendix(self, appendix_type: str) -> ReportSection:
-        """Generate appendix section"""
         appendix_prompts = {
             "appendix_irc_codes": f"List and summarize relevant IRC codes for road/highway projects in {self.location}, India. Include IRC:SP:84 for urban roads, IRC:37 for rural roads, IRC:5 for traffic standards.",
             "appendix_monsoon": f"Create a detailed monsoon calendar for {self.location}, India. Include typical rainfall patterns, construction-suitable months, and weather considerations.",
@@ -302,15 +309,15 @@ def sanitize_for_reportlab(text: str) -> str:
     
     # Escape ALL special characters first
     text = text.replace('&', '&amp;')
-    text = text.replace('<', '&lt;')
-    text = text.replace('>', '&gt;')
+    text = text.replace('<', '<')
+    text = text.replace('>', '>')
     
     # Now restore ONLY the safe tags that ReportLab supports
-    text = text.replace('&lt;b&gt;', '<b>').replace('&lt;/b&gt;', '</b>')
-    text = text.replace('&lt;i&gt;', '<i>').replace('&lt;/i&gt;', '</i>')
-    text = text.replace('&lt;u&gt;', '<u>').replace('&lt;/u&gt;', '</u>')
-    text = text.replace('&lt;strong&gt;', '<b>').replace('&lt;/strong&gt;', '</b>')
-    text = text.replace('&lt;em&gt;', '<i>').replace('&lt;/em&gt;', '</i>')
+    text = text.replace('<b>', '<b>').replace('</b>', '</b>')
+    text = text.replace('<i>', '<i>').replace('</i>', '</i>')
+    text = text.replace('<u>', '<u>').replace('</u>', '</u>')
+    text = text.replace('<strong>', '<b>').replace('</strong>', '</b>')
+    text = text.replace('<em>', '<i>').replace('</em>', '</i>')
     
     return text.strip()
 
@@ -379,6 +386,7 @@ def parse_markdown_table(text: str) -> tuple:
     
     return len(table_data) > 0, table_data
 
+
 def extract_subsections(content: str) -> List[str]:
     """Extract subsection titles from content"""
     subsections = []
@@ -410,22 +418,23 @@ def extract_subsections(content: str) -> List[str]:
     
     return subsections
 
+
 def strip_leading_numbering(text: str) -> str:
     """
     Remove leading numbering patterns, even when wrapped in markdown formatting.
     """
-    # Remove leading numbering patterns that might be after markdown formatting
     # Pattern for markdown bold followed by numbering
     patterns = [
-        r'^\s*(\*\*)?\s*(?:\d+(?:\.\d+)*\.?|\(\d+\)|\d+\)|[IVXLCDM]+\.?|\([IVXLCDM]+\)|[IVXLCDM]+\)|[A-Z]\.|\([A-Z]\)|[A-Z]\)|[\*\•]\s*)\s*(\*\*)?',
-        r'^\s*\*\*\s*(?:\d+(?:\.\d+)*\.?|\(\d+\)|\d+\)|[IVXLCDM]+\.?|\([IVXLCDM]+\)|[IVXLCDM]+\)|[A-Z]\.|\([A-Z]\)|[A-Z]\)|[\*\•]\s*)\s*\*\*'
+        # Roman numerals: require at least a dot, parenthesis, or multiple letters
+        r'^\s*(\*\*)?\s*(?:\d+(?:\.\d+)*\.?|\(\d+\)|\d+\)|(?:[IVXLCDM]{2,}|[IVXLCDM])\.|\([IVXLCDM]+\)|[IVXLCDM]+\)|[A-Za-z]\.|\([A-Za-z]\)|[A-Za-z]\)|\*\s*|\•\s*)\s*(\*\*)?',
+        r'^\s*\*\*\s*(?:\d+(?:\.\d+)*\.?|\(\d+\)|\d+\)|(?:[IVXLCDM]{2,}|[IVXLCDM])\.|\([IVXLCDM]+\)|[IVXLCDM]+\)|[A-Za-z]\.|\([A-Za-z]\)|[A-Za-z]\)|\*\s*|\•\s*)\s*\*\*'
     ]
     
     for pattern in patterns:
         text = re.sub(pattern, '', text)
     
-    # Also handle the case where numbering is at the very beginning
-    basic_pattern = r'^\s*(?:\d+(?:\.\d+)*\.?|\(\d+\)|\d+\)|[IVXLCDM]+\.?|\([IVXLCDM]+\)|[IVXLCDM]+\)|[A-Z]\.|\([A-Z]\)|[A-Z]\)|[\*\•]\s*)\s*'
+    # Basic pattern - more restrictive for Roman numerals
+    basic_pattern = r'^\s*(?:\d+(?:\.\d+)*\.?|\(\d+\)|\d+\)|(?:[IVXLCDM]{2,}|[IVXLCDM])\.|\([IVXLCDM]+\)|[IVXLCDM]+\)|[A-Za-z]\.|\([A-Za-z]\)|[A-Za-z]\)|\*\s*|\•\s*)\s*'
     text = re.sub(basic_pattern, '', text)
     
     # Remove trailing colons and asterisks
@@ -434,8 +443,14 @@ def strip_leading_numbering(text: str) -> str:
     return text.strip()
 
 
-def create_pdf_report(sections: List[ReportSection], location: str, output_path: str):
-    """Create PDF report from sections with improved formatting"""
+def create_pdf_report(
+    sections: List[ReportSection], 
+    location: str, 
+    output_path: str, 
+    image_data: List[Dict] = None, 
+    image_base_dir: str = None
+):
+    """Create PDF report with embedded images from classified_images.json"""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -489,6 +504,16 @@ def create_pdf_report(sections: List[ReportSection], location: str, output_path:
     
     story = []
 
+    # Group images by category
+    images_by_category = {}
+    if image_data:
+        for item in image_data:
+            cat = item.get("category")
+            if cat not in images_by_category:
+                images_by_category[cat] = []
+            images_by_category[cat].append(item)
+        logger.info(f"Loaded {len(image_data)} images across {len(images_by_category)} categories")
+
     # Cover page
     story.append(Paragraph("INCEPTION REPORT", title_style))
     story.append(Spacer(1, 100))
@@ -528,13 +553,48 @@ def create_pdf_report(sections: List[ReportSection], location: str, output_path:
     
     story.append(PageBreak())
 
-    # Sections with improved formatting
+    # Sections with images
     for section in sections:
-        # Section title
         story.append(Paragraph(section.title, heading_style))
         story.append(Spacer(1, 12))
-        
-        # Split content by double newlines (paragraphs)
+
+        # Insert images for this section's category
+        if section.section_id in images_by_category:
+            logger.info(f"Adding {len(images_by_category[section.section_id])} images to section: {section.section_id}")
+            
+            for img_info in images_by_category[section.section_id]:
+                img_path_str = img_info.get("img_path", "")
+                caption = img_info.get("caption", "")
+                
+                # Resolve image path relative to image_base_dir (directory of classified_images.json)
+                if image_base_dir:
+                    full_img_path = Path(image_base_dir) / img_path_str
+                else:
+                    full_img_path = Path(img_path_str)
+                
+                if full_img_path.exists():
+                    try:
+                        img = RLImage(str(full_img_path), width=6*inch, height=4*inch)
+                        img.hAlign = 'CENTER'
+                        story.append(img)
+                        story.append(Spacer(1, 6))
+                        # Add centered caption
+                        centered_caption_style = ParagraphStyle(
+                            'CenteredCaption',
+                            parent=body_style,
+                            alignment=1,
+                            fontSize=10,
+                            fontName='Helvetica-Oblique'  # Italic font
+                        )
+                        story.append(Paragraph(caption, centered_caption_style))
+                        story.append(Spacer(1, 12))
+                        logger.info(f"✓ Added image: {full_img_path.name}")
+                    except Exception as e:
+                        logger.warning(f"Failed to add image {full_img_path}: {e}")
+                else:
+                    logger.warning(f"Image not found: {full_img_path}")
+
+        # Content paragraphs
         paragraphs = section.content.split('\n\n')
         
         for para in paragraphs:
@@ -542,18 +602,14 @@ def create_pdf_report(sections: List[ReportSection], location: str, output_path:
             if not para:
                 continue
             
-            # Check if it's a table
             is_table, table_data = parse_markdown_table(para)
             
             if is_table and table_data and len(table_data) >= 2:
-                # Create table with proper wrapping
                 try:
-                    # Calculate available width
                     available_width = 6.5 * inch
                     num_cols = len(table_data[0])
                     col_widths = [available_width / num_cols] * num_cols
                     
-                    # Wrap each cell in a Paragraph for text wrapping
                     wrapped_table_data = []
                     for row_idx, row in enumerate(table_data):
                         wrapped_row = []
@@ -564,7 +620,6 @@ def create_pdf_report(sections: List[ReportSection], location: str, output_path:
                                 wrapped_row.append(Paragraph(cell, table_cell_style))
                         wrapped_table_data.append(wrapped_row)
                     
-                    # Create table with style
                     table = Table(wrapped_table_data, colWidths=col_widths, repeatRows=1)
                     table.setStyle(TableStyle([
                         # Header row
@@ -639,15 +694,13 @@ def create_pdf_report(sections: List[ReportSection], location: str, output_path:
 
     try:
         doc.build(story)
-        logger.info(f"PDF report created: {output_path}")
+        logger.info(f"✓ PDF report created: {output_path}")
     except Exception as e:
         logger.error(f"Failed to build PDF: {e}")
         raise
-# -----------------------------
-# LOCATION EXTRACTION
-# -----------------------------
+
+
 def extract_location(input_file: str) -> str:
-    """Extract location from OCR using LLM"""
     try:
         with open(input_file, "r", encoding="utf-8") as f:
             sample_text = f.read()[:5000]
@@ -712,9 +765,6 @@ Enhanced Location:"""
         return location
 
 
-# -----------------------------
-# MAIN GENERATION FUNCTION
-# -----------------------------
 def generate_inception_report(
     classified_file: str,
     output_path: str,
@@ -722,21 +772,7 @@ def generate_inception_report(
     session_id: Optional[str] = None,
     progress_store: Optional[Dict[str, Dict[str, float]]] = None
 ) -> bool:
-    """
-    Generate inception report PDF from classified data
-    
-    Args:
-        classified_file: Path to classified JSON file
-        output_path: Path to save PDF report
-        ocr_file: Optional path to OCR file for location extraction
-        session_id: Session identifier for progress tracking
-        progress_store: Optional progress dictionary to update
-        
-    Returns:
-        True if successful, False otherwise
-    """
     try:
-        # Progress callback
         def progress_callback(value: float):
             if progress_store and session_id and session_id in progress_store:
                 progress_store[session_id]["report"] = value
@@ -746,7 +782,7 @@ def generate_inception_report(
         # Extract location
         if ocr_file and Path(ocr_file).exists():
             location = extract_location(ocr_file)
-            location = enhance_location(location)
+            location = enhance_location(location)  # Added location enhancement
         else:
             location = "Unspecified location in India"
         
@@ -754,14 +790,15 @@ def generate_inception_report(
         progress_callback(10.0)
 
         # Load classified data
+        classified_path = Path(classified_file)
         try:
-            with open(classified_file, "r", encoding="utf-8") as f:
+            with open(classified_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception as e:
             logger.error(f"Failed to load classified file: {e}")
             return False
 
-        # Parse categories from classified data
+        # Parse categories
         categories_data = data.get("categories", {})
         categorized_chunks = {}
         
@@ -784,14 +821,13 @@ def generate_inception_report(
         ]
         
         sections = []
-        total_sections = len(section_categories) + 5  # +5 for appendices
+        total_sections = len(section_categories) + 5
         
         for idx, cat in enumerate(section_categories):
             chunks = categorized_chunks.get(cat, [TextChunk(text="No input provided.")])
             section = generator.generate_section(cat, chunks)
             sections.append(section)
             
-            # Update progress
             progress = 15.0 + (idx + 1) / total_sections * 70.0
             progress_callback(progress)
 
@@ -805,55 +841,71 @@ def generate_inception_report(
             appendix = generator.generate_appendix(appendix_type)
             sections.append(appendix)
             
-            # Update progress
             progress = 85.0 + (idx + 1) / len(appendix_types) * 10.0
             progress_callback(progress)
 
-        # Create PDF
+        # Load image data from classified_images.json in the same directory as classified_file
         progress_callback(95.0)
-        create_pdf_report(sections, location, output_path)
+        image_data = None
+        image_base_dir = classified_path.parent
+
+        image_json_path = image_base_dir / "classified_images.json"
+        if image_json_path.exists():
+            try:
+                with open(image_json_path, "r", encoding="utf-8") as f:
+                    image_data = json.load(f)
+                logger.info(f"Loaded {len(image_data)} images from {image_json_path}")
+            except Exception as e:
+                logger.warning(f"Failed to load image data: {e}")
+
+        # Create PDF with images
+        create_pdf_report(
+            sections, 
+            location, 
+            output_path, 
+            image_data=image_data, 
+            image_base_dir=str(image_base_dir)
+        )
         
-        # Mark complete
         progress_callback(100.0)
-        logger.info(f"Inception report generated successfully: {output_path}")
+        logger.info(f"✓ Inception report generated successfully: {output_path}")
         
         return True
 
     except Exception as e:
         logger.error(f"Report generation failed: {e}", exc_info=True)
         return False
-    
-# Add this at the end of your report_generator.py file
+
 
 # if __name__ == "__main__":
 #     import sys
-    
+#     
 #     logging.basicConfig(
 #         level=logging.INFO,
 #         format='%(asctime)s - %(levelname)s - %(message)s'
 #     )
-    
+#     
 #     # Default files in current directory
 #     classified_file = "classified.json"
 #     ocr_file = "ocr_output.txt"
 #     output_file = "inception_report.pdf"
-    
+#     
 #     # Check if files exist
 #     if not Path(classified_file).exists():
 #         print(f"❌ Error: {classified_file} not found in current directory")
 #         sys.exit(1)
-    
+#     
 #     if not Path(ocr_file).exists():
 #         print(f"⚠️  Warning: {ocr_file} not found, will use default location")
 #         ocr_file = None
-    
+#     
 #     print(f"📄 Classified: {classified_file}")
 #     print(f"📝 OCR File:   {ocr_file if ocr_file else 'Not provided'}")
 #     print(f"📋 Output:     {output_file}")
 #     print()
-    
+#     
 #     start_time = time.time()
-    
+#     
 #     success = generate_inception_report(
 #         classified_file=classified_file,
 #         output_path=output_file,
@@ -861,9 +913,9 @@ def generate_inception_report(
 #         session_id=None,
 #         progress_store=None
 #     )
-    
+#     
 #     elapsed = time.time() - start_time
-    
+#     
 #     if success:
 #         print(f"\n✅ Report generated successfully in {elapsed:.1f}s")
 #         print(f"   Output saved to: {output_file}")

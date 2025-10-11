@@ -1,5 +1,3 @@
-# src/chunking.py
-
 import re
 import json
 import logging
@@ -49,11 +47,12 @@ class ChunkingEngine:
             overlap: Number of overlapping tokens between chunks (default: 50)
             progress_callback: Optional callback for progress updates (0-100)
         """
-        self.chunk_size = chunk_size
-        self.overlap = overlap
+        # Ensure integer types to prevent type comparison errors
+        self.chunk_size = int(chunk_size)
+        self.overlap = int(overlap)
         self.progress_callback = progress_callback
         
-        logger.info(f"ChunkingEngine initialized: chunk_size={chunk_size}, overlap={overlap}")
+        logger.info(f"ChunkingEngine initialized: chunk_size={self.chunk_size}, overlap={self.overlap}")
 
     def update_progress(self, value: float):
         """Update progress via callback if available"""
@@ -169,6 +168,10 @@ def chunk_text(
         True if successful, False otherwise
     """
     try:
+        # Convert parameters to int to handle string inputs from CLI or config files
+        chunk_size = int(chunk_size)
+        overlap = int(overlap)
+        
         input_path = Path(input_path)
         output_path = Path(output_path)
 
