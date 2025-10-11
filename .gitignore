@@ -6,3 +6,5 @@ src/__pycache__/
 src/utils/__pycache__/
 uploads/
 .env
+sample/
+fin_req.txt
