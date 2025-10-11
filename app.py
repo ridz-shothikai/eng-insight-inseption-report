@@ -1,11 +1,13 @@
 # main.py
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict
 import os
 import shutil
+import zipfile
+from io import BytesIO
 from pathlib import Path
 import logging
 from datetime import datetime
@@ -16,8 +18,7 @@ from src.ocr import process_ocr
 from src.chunking import chunk_text
 from src.classifier import classify_chunks
 from src.report_generator import generate_inception_report
-from src.image_processor import process_images_to_pdf
-from src.pdf_merger import merge_pdfs
+from src.image_processor import process_images
 from src.utils.file_handler import cleanup_old_files, ensure_directories
 from src.utils.validators import validate_coordinates
 
@@ -78,7 +79,7 @@ ensure_directories([
 progress_store: Dict[str, Dict[str, float]] = {}
 # Structure: progress_store[session_id] = {
 #     "ocr": 0.0, "images": 0.0, "chunking": 0.0, "classification": 0.0,
-#     "report": 0.0, "merging": 0.0, "completed": 0.0
+#     "report": 0.0, "completed": 0.0
 # }
 
 # ---------------------------
@@ -114,7 +115,6 @@ async def log_progress(session_id: str):
         await asyncio.sleep(5)  # log every 5 seconds
 
 @app.post("/process-rfp")
-
 async def process_rfp(
     rfp_document: UploadFile = File(..., description="RFP document (PDF/Image)"),
     start_latitude: float = Form(...),
@@ -126,7 +126,6 @@ async def process_rfp(
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     logger.info(f"Starting RFP processing - Session: {session_id}")
     asyncio.create_task(log_progress(session_id))
-
 
     try:
         # ---------------------------
@@ -150,7 +149,8 @@ async def process_rfp(
         session_upload_dir = RFP_UPLOAD_DIR / session_id
         session_image_dir = IMAGE_UPLOAD_DIR / session_id
         session_output_dir = OUTPUT_DIR / session_id
-        ensure_directories([session_upload_dir, session_image_dir, session_output_dir])
+        processed_images_dir = session_output_dir / "processed_images"
+        ensure_directories([session_upload_dir, session_image_dir, session_output_dir, processed_images_dir])
 
         # Save RFP
         rfp_path = session_upload_dir / rfp_document.filename
@@ -169,11 +169,10 @@ async def process_rfp(
         # Prepare output paths
         # ---------------------------
         ocr_output_path = session_output_dir / "ocr_output.txt"
-        images_pdf_path = session_output_dir / "images_combined.pdf"
+        classified_images_json_path = session_output_dir / "classified_images.json"
         chunked_output_path = session_output_dir / "chunked_output.json"
         classified_output_path = session_output_dir / "classified_output.json"
         inception_pdf_path = session_output_dir / "inception.pdf"
-        final_pdf_path = session_output_dir / "final_merged.pdf"
 
         # ---------------------------
         # Initialize progress
@@ -184,7 +183,6 @@ async def process_rfp(
             "chunking": 0.0,
             "classification": 0.0,
             "report": 0.0,
-            "merging": 0.0,
             "completed": 0.0
         }
 
@@ -200,10 +198,11 @@ async def process_rfp(
         await asyncio.gather(
             asyncio.to_thread(process_ocr, str(rfp_path), str(ocr_output_path), session_id, progress_store),
             asyncio.to_thread(
-                process_images_to_pdf,
+                process_images,
                 [str(p) for p in image_paths],
                 coordinate_data,
-                str(images_pdf_path),
+                str(processed_images_dir),
+                str(classified_images_json_path),
                 session_id,
                 progress_store
             )
@@ -212,18 +211,28 @@ async def process_rfp(
 
         if not ocr_output_path.exists():
             raise HTTPException(status_code=500, detail="OCR processing failed")
-        if not images_pdf_path.exists():
-            raise HTTPException(status_code=500, detail="Image processing failed")
+        if not classified_images_json_path.exists():
+            raise HTTPException(status_code=500, detail="Image classification failed")
+        if not processed_images_dir.exists() or not any(processed_images_dir.iterdir()):
+            raise HTTPException(status_code=500, detail="Image processing failed - no images generated")
 
         # ---------------------------
         # Sequential dependent steps
         # ---------------------------
         progress_store[session_id]["chunking"] = 0.0
-        await asyncio.to_thread(chunk_text, str(ocr_output_path), str(chunked_output_path), session_id, progress_store)
+        await asyncio.to_thread(
+            chunk_text,
+            input_path=str(ocr_output_path),
+            output_path=str(chunked_output_path),
+            chunk_size=512,
+            overlap=50,
+            session_id=session_id,
+            progress_store=progress_store
+        )
         progress_store[session_id]["chunking"] = 100.0
 
         progress_store[session_id]["classification"] = 0.0
-        await asyncio.to_thread(classify_chunks, str(chunked_output_path), str(classified_output_path),5,session_id, progress_store)
+        await asyncio.to_thread(classify_chunks, str(chunked_output_path), str(classified_output_path), 5, session_id, progress_store)
         progress_store[session_id]["classification"] = 100.0
 
         progress_store[session_id]["report"] = 0.0
@@ -236,25 +245,13 @@ async def process_rfp(
             progress_store
         )
         progress_store[session_id]["report"] = 100.0
-
-        progress_store[session_id]["merging"] = 0.0
-        await asyncio.to_thread(
-            merge_pdfs,
-            str(inception_pdf_path),
-            str(images_pdf_path),
-            str(final_pdf_path),
-            session_id,
-            progress_store
-        )
-        progress_store[session_id]["merging"] = 100.0
         progress_store[session_id]["completed"] = 100.0
-        
 
         # ---------------------------
-        # Return final PDF
+        # Return inception PDF as final output
         # ---------------------------
         return FileResponse(
-            path=str(final_pdf_path),
+            path=str(inception_pdf_path),
             media_type="application/pdf",
             filename=f"rfp_report_{session_id}.pdf",
             headers={"Content-Disposition": f"attachment; filename=rfp_report_{session_id}.pdf"}
@@ -285,8 +282,7 @@ async def download_intermediate_file(session_id: str, file_type: str):
         "chunked": "chunked_output.json",
         "classified": "classified_output.json",
         "inception": "inception.pdf",
-        "images": "images_combined.pdf",
-        "final": "final_merged.pdf"
+        "classified_images": "classified_images.json"
     }
     if file_type not in file_mapping:
         raise HTTPException(status_code=400, detail="Invalid file type")
@@ -294,6 +290,39 @@ async def download_intermediate_file(session_id: str, file_type: str):
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(path=str(file_path), filename=file_mapping[file_type])
+
+# ---------------------------
+# Download processed images (individual or as zip)
+# ---------------------------
+@app.get("/download/{session_id}/processed_images/{image_name}")
+async def download_processed_image(session_id: str, image_name: str):
+    """Download a specific processed image"""
+    image_path = OUTPUT_DIR / session_id / "processed_images" / image_name
+    if not image_path.exists():
+        raise HTTPException(status_code=404, detail="Image not found")
+    return FileResponse(path=str(image_path), filename=image_name)
+
+@app.get("/download/{session_id}/processed_images_zip")
+async def download_all_processed_images(session_id: str):
+    """Download all processed images as a zip file"""
+    processed_images_dir = OUTPUT_DIR / session_id / "processed_images"
+    if not processed_images_dir.exists():
+        raise HTTPException(status_code=404, detail="Processed images not found")
+    
+    # Create zip file in memory
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        for image_file in processed_images_dir.iterdir():
+            if image_file.is_file():
+                zip_file.write(image_file, image_file.name)
+    
+    zip_buffer.seek(0)
+    
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename=processed_images_{session_id}.zip"}
+    )
 
 # ---------------------------
 # Cleanup session files

@@ -202,27 +202,3 @@ output/
 
 ---
 
-## 📦 Docker & GitHub Container Registry (GHCR)
-
-You can build and publish this project as a Docker image to GitHub Container Registry (ghcr.io). The repository already includes a `Dockerfile` and a GitHub Actions workflow: `.github/workflows/docker-publish.yml`.
-
-Image name and tag convention used by the workflow:
-- Image: `ghcr.io/<owner>/<repo>` (for example `ghcr.io/ridz-shothikai/eng-insight-inseption-report`)
-- Tag: the workflow pushes a tag equal to the first 7 characters of the commit SHA (short SHA). Example: `ghcr.io/<owner>/<repo>:a1b2c3d`
-
-How it works in CI:
-- On `push` to `main`, the workflow builds the image and pushes three tags: the full commit SHA, a `-full` alias, and the short 7-char SHA.
-- The short SHA is derived from the `GITHUB_SHA` environment variable and used as the primary short tag.
-
-Locally you can build and run the image (optional):
-
-```bash
-# Build locally (tags with short sha from git)
-SHORT_SHA=$(git rev-parse --short=7 HEAD)
-docker build -t ghcr.io/${GITHUB_REPOSITORY}:${SHORT_SHA} .
-
-# Run (adjust ports if your app listens on a different port)
-docker run --rm -p 8080:8080 ghcr.io/${GITHUB_REPOSITORY}:${SHORT_SHA}
-```
-
-
