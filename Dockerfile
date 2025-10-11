@@ -7,6 +7,7 @@ WORKDIR /app
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install
@@ -16,8 +17,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . /app
 
-# Expose port (if the app uses a port; adjust if not needed)
+# Expose port
 EXPOSE 8080
 
-# Default command - run app.py
-CMD ["python", "app.py"]
+# Default command
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
