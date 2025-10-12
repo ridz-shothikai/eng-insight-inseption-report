@@ -51,45 +51,154 @@ class GoogleSearchTool:
     def __init__(self):
         self.api_key = os.getenv("GOOGLE_API_KEY")
         self.cse_id = os.getenv("GOOGLE_CSE_ID")
-
+        self._cache = {}  # Cache search results
+        self._last_request_time = 0  # Track timing for rate limiting
+        self.min_request_interval = 0.1  # Minimum 100ms between requests
+    
+    def _wait_for_rate_limit(self):
+        """Ensure minimum interval between requests"""
+        current_time = time.time()
+        time_since_last = current_time - self._last_request_time
+        
+        if time_since_last < self.min_request_interval:
+            time.sleep(self.min_request_interval - time_since_last)
+        
+        self._last_request_time = time.time()
+    
     def search(self, query: str, max_retries: int = 3) -> Dict:
+        """
+        Search Google with caching and exponential backoff
+        
+        Args:
+            query: Search query string
+            max_retries: Maximum retry attempts on failure
+            
+        Returns:
+            Dict with 'results' key containing list of search results
+        """
         if not self.api_key or not self.cse_id:
             logger.warning("Google Search API credentials not found, skipping search")
             return {"results": []}
-
-        params = {"key": self.api_key, "cx": self.cse_id, "q": query, "num": 3}
-
+        
+        # Check cache first
+        cache_key = query.lower().strip()
+        if cache_key in self._cache:
+            logger.info(f"Cache hit for query: {query[:50]}...")
+            return self._cache[cache_key]
+        
+        params = {
+            "key": self.api_key, 
+            "cx": self.cse_id, 
+            "q": query, 
+            "num": 3, # Reduced from default to save quota
+            "safe": "off"
+        }
+        
         for attempt in range(max_retries + 1):
             try:
-                time.sleep(0.5)
-                response = requests.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=10)
-
+                # Rate limiting with minimum interval
+                self._wait_for_rate_limit()
+                
+                response = requests.get(
+                    "https://www.googleapis.com/customsearch/v1", 
+                    params=params, 
+                    timeout=10
+                )
+                
+                # Handle rate limiting with exponential backoff
                 if response.status_code == 429:
-                    logger.warning(f"Rate limited. Retrying in 30s... (attempt {attempt+1})")
-                    time.sleep(30)
-                    continue
-
-                response.raise_for_status()
-                data = response.json()
-
-                if "error" in data:
-                    logger.error(f"Search API error: {data.get('error')}")
+                    if attempt < max_retries:
+                        # Exponential backoff: 2, 4, 8 seconds
+                        delay = 2 ** (attempt + 1)
+                        logger.warning(f"Rate limited. Retrying in {delay}s... (attempt {attempt+1}/{max_retries})")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        logger.error("Max retries exceeded for rate limit")
+                        return {"results": []}
+                
+                # Handle other HTTP errors
+                if response.status_code != 200:
+                    logger.error(f"Search API returned status {response.status_code}")
+                    if attempt < max_retries:
+                        time.sleep(2 ** attempt)  # Exponential backoff
+                        continue
                     return {"results": []}
-
+                
+                data = response.json()
+                
+                # Check for API errors in response
+                if "error" in data:
+                    error_msg = data.get("error", {})
+                    logger.error(f"Search API error: {error_msg}")
+                    
+                    # Check if it's a quota error
+                    if isinstance(error_msg, dict) and error_msg.get("code") == 429:
+                        if attempt < max_retries:
+                            delay = 2 ** (attempt + 1)
+                            logger.warning(f"Quota exceeded. Retrying in {delay}s...")
+                            time.sleep(delay)
+                            continue
+                    
+                    return {"results": []}
+                
+                # Parse results
                 results = [
-                    {"title": item.get("title", ""), "snippet": item.get("snippet", "")}
-                    for item in data.get("items", []) if item.get("snippet")
+                    {
+                        "title": item.get("title", "").strip(), 
+                        "snippet": item.get("snippet", "").strip(),
+                        "link": item.get("link", "")  # Include link for reference
+                    }
+                    for item in data.get("items", []) 
+                    if item.get("snippet", "").strip()  # Only include items with snippets
                 ]
-                return {"results": results}
-
-            except Exception as e:
-                logger.error(f"Search error: {e}")
+                
+                # Cache successful results
+                result_dict = {"results": results}
+                self._cache[cache_key] = result_dict
+                
+                logger.info(f"Search successful: {len(results)} results for '{query[:50]}...'")
+                return result_dict
+            
+            except requests.Timeout:
+                logger.warning(f"Search timeout (attempt {attempt+1}/{max_retries})")
                 if attempt < max_retries:
-                    time.sleep(30)
-
+                    time.sleep(2 ** attempt)
+                    continue
+                return {"results": []}
+            
+            except requests.RequestException as e:
+                logger.error(f"Request error: {e}")
+                if attempt < max_retries:
+                    time.sleep(2 ** attempt)
+                    continue
+                return {"results": []}
+            
+            except Exception as e:
+                logger.error(f"Unexpected search error: {e}", exc_info=True)
+                if attempt < max_retries:
+                    time.sleep(2 ** attempt)
+                    continue
+                return {"results": []}
+        
+        # All retries exhausted
+        logger.error(f"Search failed after {max_retries} retries")
         return {"results": []}
-
-
+    
+    def clear_cache(self):
+        """Clear the search cache"""
+        self._cache.clear()
+        logger.info("Search cache cleared")
+    
+    def get_cache_stats(self) -> Dict:
+        """Get cache statistics"""
+        return {
+            "cached_queries": len(self._cache),
+            "cache_size_bytes": sum(
+                len(str(v)) for v in self._cache.values()
+            )
+        }
+    
 # -----------------------------
 # CONTENT GENERATOR
 # -----------------------------
@@ -152,25 +261,6 @@ class ContentGenerator:
         self.location = location
         self.search_tool = GoogleSearchTool()
         self.progress_callback = progress_callback
-
-        # self.safety_settings = [
-        #     {
-        #         "category": "HARM_CATEGORY_HARASSMENT",
-        #         "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-        #     },
-        #     {
-        #         "category": "HARM_CATEGORY_HATE_SPEECH", 
-        #         "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-        #     },
-        #     {
-        #         "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-        #         "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-        #     },
-        #     {
-        #         "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-        #         "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-        #     },
-        # ]
         
         logger.info(f"ContentGenerator initialized for location: {location}")
 
@@ -181,23 +271,58 @@ class ContentGenerator:
             except Exception as e:
                 logger.warning(f"Progress callback error: {e}")
 
-    def _gather_context(self, category: str) -> str:
-        queries = self.SEARCH_QUERIES.get(category, [])
-        context = f"\n=== EXTERNAL RESEARCH CONTEXT FOR {self.location.upper()} ===\n"
+def _gather_context(self, category: str) -> str:
+    """
+    Gather external context for sections that need it.
+    Skips search for sections that don't benefit from external data.
+    """
+    # Skip search entirely for sections that don't need it
+    if category not in self.SEARCH_REQUIRED_SECTIONS:
+        logger.debug(f"Skipping search for '{category}' (not search-dependent)")
+        return ""
+    
+    queries = self.SEARCH_QUERIES.get(category, [])
+    
+    # If no queries defined for this category, skip
+    if not queries:
+        logger.debug(f"No search queries defined for '{category}'")
+        return ""
+    
+    context = f"\n=== EXTERNAL RESEARCH CONTEXT FOR {self.location.upper()} ===\n"
+    successful_searches = 0
+    
+    # Limit to first 2 queries per category to save API calls
+    for query_template in queries[:2]:
+        query = query_template.format(location=self.location)
         
-        for query_template in queries:
-            query = query_template.format(location=self.location)
+        try:
             results = self.search_tool.search(query)
             
             if results.get("results"):
                 context += f"\nQuery: {query}\n"
-                for i, r in enumerate(results["results"][:2], 1):
-                    context += f"  {i}. {r.get('snippet', '')}\n"
+                # Take only top 1-2 results (reduced from your original 2 for speed)
+                for i, r in enumerate(results["results"][:1], 1):  # Changed to 1 result
+                    snippet = r.get('snippet', '').strip()
+                    if snippet:
+                        context += f"  {i}. {snippet}\n"
+                        successful_searches += 1
             else:
-                context += f"\nQuery: {query} → No results found.\n"
+                # Don't clutter context with "no results" messages
+                logger.debug(f"No results for query: {query}")
         
-        context += "\n=== END EXTERNAL CONTEXT ===\n"
-        return context
+        except Exception as e:
+            logger.warning(f"Search failed for '{query}': {e}")
+            continue
+    
+    context += "\n=== END EXTERNAL CONTEXT ===\n"
+    
+    # If no successful searches, return empty string to avoid unnecessary API tokens
+    if successful_searches == 0:
+        logger.info(f"No search results found for '{category}'")
+        return ""
+    
+    logger.info(f"Gathered context for '{category}': {successful_searches} search results")
+    return context
 
     def _get_section_prompt(self, category: str, chunks: List[TextChunk]) -> str:
         combined_chunks = "\n".join([c.text.strip() for c in chunks if c.text.strip()]) or "No specific project details were provided."
@@ -714,13 +839,22 @@ def extract_location(input_file: str) -> str:
     genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
     model = genai.GenerativeModel("gemini-2.5-flash")
     
-    prompt = f"""Extract ONLY the primary city/place from the text for a road/highway/bridge project in India.
+    prompt = f"""You are analyzing a road/highway/bridge construction project document in India.
 
-Text:
+Extract the PRIMARY project location (city/town/district) from the text below. The text may mention multiple places - identify the MAIN project site where construction will occur.
+
+INSTRUCTIONS:
+- Look for phrases like "project site", "construction location", "project area", "site at", "located at"
+- Prioritize locations mentioned in project titles, headings, or early sections
+- If multiple locations appear, choose the one most prominently featured as the construction site
+- Ignore references to head offices, consultant offices, or secondary locations
+- Return ONLY the location name in format: "City" or "City, District" or "City, District, State"
+- Do NOT include project names, road numbers (NH-XX), or additional explanations
+
+TEXT:
 {sample_text}
 
-Respond with just the location name, nothing else.
-Location:"""
+PRIMARY PROJECT LOCATION:"""
     
     try:
         location = model.generate_content(prompt).text.strip()
@@ -745,15 +879,29 @@ def enhance_location(location: str) -> str:
     genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
     model = genai.GenerativeModel("gemini-2.5-flash")
     
-    prompt = f"""Enhance location into format 'City, District, State' for India.
+    prompt = f"""You are enhancing a location name for a construction project in India.
 
-Original: {location}
+ORIGINAL LOCATION: {location}
 
-Search Results:
+SEARCH CONTEXT:
 {context}
 
-Respond with just the enhanced location in format: City, District, State
-Enhanced Location:"""
+TASK:
+- Convert the original location into the format: "City, District, State"
+- Use the search context to identify the correct district and state
+- If the original already has district/state, verify and correct if needed
+- Use official Indian administrative names (e.g., "Uttar Pradesh" not "UP")
+- If district is unclear, use the district where the city/town is located
+- If context is insufficient, make best estimate based on known geography
+
+EXAMPLES:
+- "Lucknow" → "Lucknow, Lucknow, Uttar Pradesh"
+- "Noida" → "Noida, Gautam Buddha Nagar, Uttar Pradesh"
+- "Mumbai" → "Mumbai, Mumbai Suburban, Maharashtra"
+
+RESPOND WITH ONLY THE ENHANCED LOCATION, NO EXPLANATION.
+
+ENHANCED LOCATION:"""
     
     try:
         enhanced = model.generate_content(prompt).text.strip()
