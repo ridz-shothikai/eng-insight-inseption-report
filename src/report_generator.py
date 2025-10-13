@@ -15,13 +15,13 @@ load_dotenv()
 
 import google.generativeai as genai
 import requests
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, KeepTogether, Table, TableStyle
 from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, KeepTogether
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.lib import colors
-from reportlab.platypus import Table, TableStyle
 from reportlab.platypus import Image as RLImage
+from reportlab.platypus import PageBreak
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +224,13 @@ class ContentGenerator:
         "appendix_compliance_matrix": "Appendix E: Compliance Matrix"
     }
 
+    SEARCH_REQUIRED_SECTIONS = {
+        "site_appreciation",
+        "compliances",
+        "design_standards",
+        "methodology"
+    }
+
     SEARCH_QUERIES = {
         "site_appreciation": [
             "site details road project {location}",
@@ -271,58 +278,58 @@ class ContentGenerator:
             except Exception as e:
                 logger.warning(f"Progress callback error: {e}")
 
-def _gather_context(self, category: str) -> str:
-    """
-    Gather external context for sections that need it.
-    Skips search for sections that don't benefit from external data.
-    """
-    # Skip search entirely for sections that don't need it
-    if category not in self.SEARCH_REQUIRED_SECTIONS:
-        logger.debug(f"Skipping search for '{category}' (not search-dependent)")
-        return ""
-    
-    queries = self.SEARCH_QUERIES.get(category, [])
-    
-    # If no queries defined for this category, skip
-    if not queries:
-        logger.debug(f"No search queries defined for '{category}'")
-        return ""
-    
-    context = f"\n=== EXTERNAL RESEARCH CONTEXT FOR {self.location.upper()} ===\n"
-    successful_searches = 0
-    
-    # Limit to first 2 queries per category to save API calls
-    for query_template in queries[:2]:
-        query = query_template.format(location=self.location)
+    def _gather_context(self, category: str) -> str:
+        """
+        Gather external context for sections that need it.
+        Skips search for sections that don't benefit from external data.
+        """
+        # Skip search entirely for sections that don't need it
+        if category not in self.SEARCH_REQUIRED_SECTIONS:
+            logger.debug(f"Skipping search for '{category}' (not search-dependent)")
+            return ""
         
-        try:
-            results = self.search_tool.search(query)
+        queries = self.SEARCH_QUERIES.get(category, [])
+        
+        # If no queries defined for this category, skip
+        if not queries:
+            logger.debug(f"No search queries defined for '{category}'")
+            return ""
+        
+        context = f"\n=== EXTERNAL RESEARCH CONTEXT FOR {self.location.upper()} ===\n"
+        successful_searches = 0
+        
+        # Limit to first 2 queries per category to save API calls
+        for query_template in queries[:2]:
+            query = query_template.format(location=self.location)
             
-            if results.get("results"):
-                context += f"\nQuery: {query}\n"
-                # Take only top 1-2 results (reduced from your original 2 for speed)
-                for i, r in enumerate(results["results"][:1], 1):  # Changed to 1 result
-                    snippet = r.get('snippet', '').strip()
-                    if snippet:
-                        context += f"  {i}. {snippet}\n"
-                        successful_searches += 1
-            else:
-                # Don't clutter context with "no results" messages
-                logger.debug(f"No results for query: {query}")
+            try:
+                results = self.search_tool.search(query)
+                
+                if results.get("results"):
+                    context += f"\nQuery: {query}\n"
+                    # Take only top 1-2 results (reduced from your original 2 for speed)
+                    for i, r in enumerate(results["results"][:1], 1):  # Changed to 1 result
+                        snippet = r.get('snippet', '').strip()
+                        if snippet:
+                            context += f"  {i}. {snippet}\n"
+                            successful_searches += 1
+                else:
+                    # Don't clutter context with "no results" messages
+                    logger.debug(f"No results for query: {query}")
+            
+            except Exception as e:
+                logger.warning(f"Search failed for '{query}': {e}")
+                continue
         
-        except Exception as e:
-            logger.warning(f"Search failed for '{query}': {e}")
-            continue
-    
-    context += "\n=== END EXTERNAL CONTEXT ===\n"
-    
-    # If no successful searches, return empty string to avoid unnecessary API tokens
-    if successful_searches == 0:
-        logger.info(f"No search results found for '{category}'")
-        return ""
-    
-    logger.info(f"Gathered context for '{category}': {successful_searches} search results")
-    return context
+        context += "\n=== END EXTERNAL CONTEXT ===\n"
+        
+        # If no successful searches, return empty string to avoid unnecessary API tokens
+        if successful_searches == 0:
+            logger.info(f"No search results found for '{category}'")
+            return ""
+        
+        logger.info(f"Gathered context for '{category}': {successful_searches} search results")
+        return context
 
     def _get_section_prompt(self, category: str, chunks: List[TextChunk]) -> str:
         combined_chunks = "\n".join([c.text.strip() for c in chunks if c.text.strip()]) or "No specific project details were provided."
@@ -617,6 +624,15 @@ def create_pdf_report(
         alignment=0
     )
     
+    # NEW: Style for TOC links
+    toc_link_style = ParagraphStyle(
+        'TOCLink',
+        parent=body_style,
+        fontSize=11,
+        textColor=colors.HexColor('#2980b9'),  # Blue color for links
+        underline=False  # Optional: set to True for underlined links
+    )
+    
     # Style for table cells with word wrapping
     table_cell_style = ParagraphStyle(
         'TableCell',
@@ -649,11 +665,11 @@ def create_pdf_report(
     story.append(Paragraph(f"Generated on: {datetime.now().strftime('%d %B %Y')}", body_style))
     story.append(PageBreak())
 
-    # Table of Contents
+    # Table of Contents with clickable links
     story.append(Paragraph("Table of Contents", heading_style))
     story.append(Spacer(1, 20))
     
-    # TOC subsection style
+    # TOC subsection style with link color
     toc_sub_style = ParagraphStyle(
         'TOCSub',
         parent=styles['BodyText'],
@@ -662,25 +678,36 @@ def create_pdf_report(
         leftIndent=20,
         spaceBefore=2,
         spaceAfter=2,
-        textColor=colors.HexColor('#555555')
+        textColor=colors.HexColor('#2980b9')  # Blue for clickable links
     )
     
+    # NEW: Generate TOC with internal links
     for sec in sections:
         clean_title = strip_leading_numbering(sec.title)
-        story.append(Paragraph(f"<b>• {clean_title}</b>", body_style))
+        # Create anchor name from section_id
+        anchor_name = f"section_{sec.section_id}"
+        
+        # Create clickable link in TOC
+        toc_entry = f'<b><a href="#{anchor_name}" color="blue">• {clean_title}</a></b>'
+        story.append(Paragraph(toc_entry, toc_link_style))
         
         subsections = extract_subsections(sec.content)
-        for subsection in subsections[1:]:
+        for idx, subsection in enumerate(subsections[:5]):  # Limit subsections in TOC
             clean_sub = strip_leading_numbering(subsection.strip())
-            story.append(Paragraph(f"  ◦ {clean_sub}", toc_sub_style))
+            sub_anchor = f"section_{sec.section_id}_sub_{idx}"
+            toc_sub_entry = f'<a href="#{sub_anchor}" color="#2980b9">  ◦ {clean_sub}</a>'
+            story.append(Paragraph(toc_sub_entry, toc_sub_style))
         
         story.append(Spacer(1, 6))
     
     story.append(PageBreak())
 
-    # Sections with images
+    # Sections with images and bookmarks
     for section in sections:
-        story.append(Paragraph(section.title, heading_style))
+        # NEW: Add bookmark/anchor for this section
+        anchor_name = f"section_{section.section_id}"
+        section_title_with_anchor = f'<a name="{anchor_name}"/>{section.title}'
+        story.append(Paragraph(section_title_with_anchor, heading_style))
         story.append(Spacer(1, 12))
 
         # Insert images for this section's category
@@ -722,7 +749,7 @@ def create_pdf_report(
         # Content paragraphs
         paragraphs = section.content.split('\n\n')
         
-        for para in paragraphs:
+        for para_idx, para in enumerate(paragraphs):
             para = para.strip()
             if not para:
                 continue
