@@ -583,6 +583,15 @@ def create_pdf_report(
         alignment=0,
         wordWrap='CJK'
     )
+
+    toc_style = ParagraphStyle(
+    'TOC',
+    parent=styles['BodyText'],
+    fontSize=11,
+    leading=18,
+    textColor=colors.HexColor('#2980b9'),  # Blue for clickable look
+    leftIndent=20
+)
     
     story = []
 
@@ -622,9 +631,12 @@ def create_pdf_report(
         textColor=colors.HexColor('#555555')
     )
     
-    for sec in sections:
+    for i, sec in enumerate(sections, 1):
+        section_id = f"section_{i}"
         clean_title = strip_leading_numbering(sec.title)
-        story.append(Paragraph(f"<b>• {clean_title}</b>", body_style))
+        # Create clickable link
+        toc_entry = f'<link href="#{section_id}" color="blue">{i}. {clean_title}</link>'
+        story.append(Paragraph(toc_entry, toc_style))
         
         subsections = extract_subsections(sec.content)
         for subsection in subsections[1:]:
@@ -637,7 +649,8 @@ def create_pdf_report(
 
     # Sections with images
     for section in sections:
-        story.append(Paragraph(section.title, heading_style))
+        section_id = f"section_{sections.index(section) + 1}"
+        story.append(Paragraph(f'<a name="{section_id}"/>{section.title}', heading_style))
         story.append(Spacer(1, 12))
 
         # Insert images for this section's category
