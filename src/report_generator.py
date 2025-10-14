@@ -23,6 +23,10 @@ from reportlab.lib import colors
 from reportlab.platypus import Table, TableStyle
 from reportlab.platypus import Image as RLImage
 
+from reportlab.platypus import Frame
+from reportlab.platypus import PageTemplate
+from reportlab.pdfgen import canvas
+
 logger = logging.getLogger(__name__)
 
 
@@ -442,6 +446,51 @@ def strip_leading_numbering(text: str) -> str:
     
     return text.strip()
 
+def add_page_decorations(canvas_obj, doc):
+    """
+    Draws header and footer on EVERY page.
+    Uses absolute canvas coordinates (0,0 is bottom-left of entire page).
+    """
+    logger.info(f"Drawing decorations on page {doc.page}")  # Add this line
+    canvas_obj.saveState()
+    
+    logo_dir = Path(__file__).parent.parent / "logo"
+    top_img = logo_dir / "top.jpeg"
+    bottom_img = logo_dir / "bottom.jpeg"
+    page_width, page_height = A4
+
+    # Header: top of page
+    if top_img.exists():
+        try:
+            canvas_obj.drawImage(
+                str(top_img),
+                x=0,
+                y=page_height - 0.75 * inch,
+                width=page_width,
+                height=0.75 * inch,
+                preserveAspectRatio=False,
+                mask='auto'
+            )
+        except Exception as e:
+            logger.error(f"Failed to draw top image: {e}")
+
+    # Footer: bottom of page
+    if bottom_img.exists():
+        try:
+            canvas_obj.drawImage(
+                str(bottom_img),
+                x=0,
+                y=0,
+                width=page_width,
+                height=0.75 * inch,
+                preserveAspectRatio=False,
+                mask='auto'
+            )
+        except Exception as e:
+            logger.error(f"Failed to draw bottom image: {e}")
+    
+    canvas_obj.restoreState()  # Restore the state
+
 
 def create_pdf_report(
     sections: List[ReportSection], 
@@ -454,14 +503,47 @@ def create_pdf_report(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
+    # Page dimensions
+    page_width, page_height = A4
+    
+    # Margins for content (leave space for header/footer)
+    left_margin = right_margin = 72
+    top_margin = 72 + 0.75 * inch  # Extra space for header
+    bottom_margin = 72 + 0.75 * inch  # Extra space for footer
+
+    # Initialize document first
     doc = SimpleDocTemplate(
         str(output_path),
         pagesize=A4,
-        rightMargin=72,
-        leftMargin=72,
-        topMargin=72,
-        bottomMargin=72
+        leftMargin=left_margin,
+        rightMargin=right_margin,
+        topMargin=top_margin,
+        bottomMargin=bottom_margin
     )
+
+    # Create frames for body content (avoiding header/footer space)
+    frame = Frame(
+        left_margin,
+        bottom_margin,
+        page_width - left_margin - right_margin,
+        page_height - top_margin - bottom_margin,
+        leftPadding=6,
+        bottomPadding=6,
+        rightPadding=6,
+        topPadding=6,
+        id='normal'
+    )
+
+    # Create custom page template with the decoration function
+    page_template = PageTemplate(
+        id='with_decorations',
+        frames=[frame],
+        onPage=add_page_decorations,
+        pagesize=A4
+    )
+
+    # Add the template to the document
+    doc.addPageTemplates([page_template])
     
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle(
@@ -501,6 +583,15 @@ def create_pdf_report(
         alignment=0,
         wordWrap='CJK'
     )
+
+    toc_style = ParagraphStyle(
+    'TOC',
+    parent=styles['BodyText'],
+    fontSize=11,
+    leading=18,
+    textColor=colors.HexColor('#2980b9'),  # Blue for clickable look
+    leftIndent=20
+)
     
     story = []
 
@@ -540,9 +631,12 @@ def create_pdf_report(
         textColor=colors.HexColor('#555555')
     )
     
-    for sec in sections:
+    for i, sec in enumerate(sections, 1):
+        section_id = f"section_{i}"
         clean_title = strip_leading_numbering(sec.title)
-        story.append(Paragraph(f"<b>• {clean_title}</b>", body_style))
+        # Create clickable link
+        toc_entry = f'<link href="#{section_id}" color="blue">{i}. {clean_title}</link>'
+        story.append(Paragraph(toc_entry, toc_style))
         
         subsections = extract_subsections(sec.content)
         for subsection in subsections[1:]:
@@ -555,7 +649,8 @@ def create_pdf_report(
 
     # Sections with images
     for section in sections:
-        story.append(Paragraph(section.title, heading_style))
+        section_id = f"section_{sections.index(section) + 1}"
+        story.append(Paragraph(f'<a name="{section_id}"/>{section.title}', heading_style))
         story.append(Spacer(1, 12))
 
         # Insert images for this section's category
@@ -693,7 +788,8 @@ def create_pdf_report(
         story.append(PageBreak())
 
     try:
-        doc.build(story)
+        # Build PDF - this will apply the template to all pages
+        doc.build(story, onFirstPage=add_page_decorations, onLaterPages=add_page_decorations)
         logger.info(f"✓ PDF report created: {output_path}")
     except Exception as e:
         logger.error(f"Failed to build PDF: {e}")
