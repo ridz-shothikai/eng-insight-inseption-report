@@ -3,6 +3,7 @@
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from sse_starlette.sse import EventSourceResponse
 from typing import List, Dict
 import os
 import shutil
@@ -12,6 +13,7 @@ from pathlib import Path
 import logging
 from datetime import datetime
 import asyncio
+import json
 
 # Import your processing modules
 from src.ocr import process_ocr
@@ -21,6 +23,7 @@ from src.report_generator import generate_inception_report
 from src.image_processor import process_images
 from src.utils.file_handler import cleanup_old_files, ensure_directories
 from src.utils.validators import validate_coordinates
+from src.utils.log_streamer import log_streamer, SessionLogHandler
 
 # ---------------------------
 # Logging setup
@@ -38,6 +41,20 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Add session log handler for streaming
+session_log_handler = SessionLogHandler(log_streamer)
+session_log_handler.setFormatter(logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+))
+logger.addHandler(session_log_handler)
+
+# ---------------------------
+# Session logging helper
+# ---------------------------
+def log_with_session(message: str, session_id: str, level=logging.INFO):
+    """Helper to log with session context"""
+    logger.log(level, message, extra={'session_id': session_id})
 
 # ---------------------------
 # FastAPI app
@@ -111,7 +128,7 @@ async def health_check():
 # ---------------------------
 async def log_progress(session_id: str):
     while session_id in progress_store and progress_store[session_id]["completed"] < 100.0:
-        logger.info(f"Progress [{session_id}]: {progress_store[session_id]}")
+        log_with_session(f"Progress: {progress_store[session_id]}", session_id)  # CHANGED
         await asyncio.sleep(5)  # log every 5 seconds
 
 @app.post("/process-rfp")
@@ -124,7 +141,7 @@ async def process_rfp(
     images: List[UploadFile] = File(...),
 ):
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    logger.info(f"Starting RFP processing - Session: {session_id}")
+    log_with_session("🚀 Starting RFP processing", session_id)  # CHANGED
     asyncio.create_task(log_progress(session_id))
 
     try:
@@ -143,6 +160,8 @@ async def process_rfp(
             if img.content_type not in allowed_image_types:
                 raise HTTPException(status_code=400, detail=f"Invalid image type for {img.filename}")
 
+        log_with_session(f"✓ Validation passed: {len(images)} images, coordinates validated", session_id)  # ADDED
+
         # ---------------------------
         # Directories
         # ---------------------------
@@ -156,6 +175,7 @@ async def process_rfp(
         rfp_path = session_upload_dir / rfp_document.filename
         with open(rfp_path, "wb") as f:
             shutil.copyfileobj(rfp_document.file, f)
+        log_with_session(f"📄 Saved RFP document: {rfp_document.filename}", session_id)  # ADDED
 
         # Save images
         image_paths = []
@@ -164,6 +184,7 @@ async def process_rfp(
             with open(img_path, "wb") as f:
                 shutil.copyfileobj(image.file, f)
             image_paths.append(img_path)
+        log_with_session(f"📸 Saved {len(images)} images", session_id)  # ADDED
 
         # ---------------------------
         # Prepare output paths
@@ -194,7 +215,7 @@ async def process_rfp(
         # ---------------------------
         # Parallel tasks: OCR + Images
         # ---------------------------
-        logger.info(f"Session {session_id}: Running OCR and processing images in parallel")
+        log_with_session("⚡ Running OCR and image processing in parallel", session_id)  # CHANGED
         await asyncio.gather(
             asyncio.to_thread(process_ocr, str(rfp_path), str(ocr_output_path), session_id, progress_store),
             asyncio.to_thread(
@@ -216,9 +237,12 @@ async def process_rfp(
         if not processed_images_dir.exists() or not any(processed_images_dir.iterdir()):
             raise HTTPException(status_code=500, detail="Image processing failed - no images generated")
 
+        log_with_session("✓ Parallel processing completed", session_id)  # ADDED
+
         # ---------------------------
         # Sequential dependent steps
         # ---------------------------
+        log_with_session("📝 Starting text chunking", session_id)  # ADDED
         progress_store[session_id]["chunking"] = 0.0
         await asyncio.to_thread(
             chunk_text,
@@ -230,11 +254,15 @@ async def process_rfp(
             progress_store=progress_store
         )
         progress_store[session_id]["chunking"] = 100.0
+        log_with_session("✓ Text chunking completed", session_id)  # ADDED
 
+        log_with_session("🏷️ Starting chunk classification", session_id)  # ADDED
         progress_store[session_id]["classification"] = 0.0
         await asyncio.to_thread(classify_chunks, str(chunked_output_path), str(classified_output_path), 5, session_id, progress_store)
         progress_store[session_id]["classification"] = 100.0
+        log_with_session("✓ Chunk classification completed", session_id)  # ADDED
 
+        log_with_session("📊 Generating inception report", session_id)  # ADDED
         progress_store[session_id]["report"] = 0.0
         await asyncio.to_thread(
             generate_inception_report,
@@ -246,6 +274,7 @@ async def process_rfp(
         )
         progress_store[session_id]["report"] = 100.0
         progress_store[session_id]["completed"] = 100.0
+        log_with_session("✅ Processing complete! Report generated", session_id)  # ADDED
 
         # ---------------------------
         # Return inception PDF as final output
@@ -260,7 +289,7 @@ async def process_rfp(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Session {session_id}: Error - {str(e)}", exc_info=True)
+        log_with_session(f"❌ Error: {str(e)}", session_id, logging.ERROR)  # CHANGED
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
 
 # ---------------------------
@@ -292,37 +321,120 @@ async def download_intermediate_file(session_id: str, file_type: str):
     return FileResponse(path=str(file_path), filename=file_mapping[file_type])
 
 # ---------------------------
-# Download processed images (individual or as zip)
+# Get all sessions endpoint
 # ---------------------------
-@app.get("/download/{session_id}/processed_images/{image_name}")
-async def download_processed_image(session_id: str, image_name: str):
-    """Download a specific processed image"""
-    image_path = OUTPUT_DIR / session_id / "processed_images" / image_name
-    if not image_path.exists():
-        raise HTTPException(status_code=404, detail="Image not found")
-    return FileResponse(path=str(image_path), filename=image_name)
+@app.get("/sessions")
+async def get_all_sessions():
+    """Get all active session IDs and their progress"""
+    if not progress_store:
+        return {"sessions": [], "count": 0}
+    
+    sessions = []
+    for session_id, progress in progress_store.items():
+        sessions.append({
+            "session_id": session_id,
+            "progress": progress,
+            "is_complete": progress.get("completed", 0) >= 100.0
+        })
+    
+    return {
+        "sessions": sessions,
+        "count": len(sessions)
+    }
 
-@app.get("/download/{session_id}/processed_images_zip")
-async def download_all_processed_images(session_id: str):
-    """Download all processed images as a zip file"""
-    processed_images_dir = OUTPUT_DIR / session_id / "processed_images"
-    if not processed_images_dir.exists():
-        raise HTTPException(status_code=404, detail="Processed images not found")
+# ---------------------------
+# Get specific session details
+# ---------------------------
+@app.get("/sessions/{session_id}")
+async def get_session_details(session_id: str):
+    """Get details for a specific session"""
+    if session_id not in progress_store:
+        raise HTTPException(status_code=404, detail="Session not found")
     
-    # Create zip file in memory
-    zip_buffer = BytesIO()
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        for image_file in processed_images_dir.iterdir():
-            if image_file.is_file():
-                zip_file.write(image_file, image_file.name)
+    session_dir = OUTPUT_DIR / session_id
+    files_available = []
     
-    zip_buffer.seek(0)
+    if session_dir.exists():
+        file_checks = {
+            "ocr": session_dir / "ocr_output.txt",
+            "chunked": session_dir / "chunked_output.json",
+            "classified": session_dir / "classified_output.json",
+            "inception": session_dir / "inception.pdf",
+            "classified_images": session_dir / "classified_images.json",
+            "processed_images": session_dir / "processed_images"
+        }
+        
+        for file_type, path in file_checks.items():
+            if path.exists():
+                if path.is_dir():
+                    files_available.append({
+                        "type": file_type,
+                        "count": len(list(path.iterdir()))
+                    })
+                else:
+                    files_available.append({
+                        "type": file_type,
+                        "size": path.stat().st_size
+                    })
     
-    return StreamingResponse(
-        zip_buffer,
-        media_type="application/zip",
-        headers={"Content-Disposition": f"attachment; filename=processed_images_{session_id}.zip"}
-    )
+    return {
+        "session_id": session_id,
+        "progress": progress_store[session_id],
+        "files_available": files_available
+    }
+
+# ---------------------------
+# Log streaming endpoint (SSE)
+# ---------------------------
+@app.get("/stream-logs/{session_id}")
+async def stream_logs(session_id: str):
+    """Stream logs and progress for a specific session using Server-Sent Events"""
+    
+    async def event_generator():
+        queue = log_streamer.add_client(session_id)
+        last_progress = {}
+        
+        try:
+            # Send initial connection message
+            yield {
+                "event": "connected",
+                "data": json.dumps({"message": f"Connected to log stream for session {session_id}"})
+            }
+            
+            while True:
+                try:
+                    # Wait for logs with timeout
+                    log_message = await asyncio.wait_for(queue.get(), timeout=0.5)
+                    yield {
+                        "event": "log",
+                        "data": json.dumps({"message": log_message})
+                    }
+                except asyncio.TimeoutError:
+                    # No log received, send progress update instead
+                    if session_id in progress_store:
+                        current_progress = progress_store[session_id]
+                        if current_progress != last_progress:
+                            yield {
+                                "event": "progress",
+                                "data": json.dumps(current_progress)
+                            }
+                            last_progress = current_progress.copy()
+                        
+                        # Check if completed
+                        if current_progress.get("completed", 0) >= 100:
+                            yield {
+                                "event": "complete",
+                                "data": json.dumps({"message": "Processing complete"})
+                            }
+                            break
+                    
+        except asyncio.CancelledError:
+            log_streamer.remove_client(session_id, queue)
+            raise
+        finally:
+            log_streamer.remove_client(session_id, queue)
+    
+    return EventSourceResponse(event_generator())
 
 # ---------------------------
 # Cleanup session files
