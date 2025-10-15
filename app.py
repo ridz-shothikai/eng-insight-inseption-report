@@ -189,9 +189,8 @@ async def process_rfp(
     images: List[UploadFile] = File(...),
 ):
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_with_session("🚀 Starting RFP processing", session_id)  # CHANGED
-    asyncio.create_task(log_progress(session_id))
-
+    log_with_session("🚀 Starting RFP processing", session_id)
+    
     try:
         # ---------------------------
         # Validation
@@ -208,7 +207,7 @@ async def process_rfp(
             if img.content_type not in allowed_image_types:
                 raise HTTPException(status_code=400, detail=f"Invalid image type for {img.filename}")
 
-        log_with_session(f"✓ Validation passed: {len(images)} images, coordinates validated", session_id)  # ADDED
+        log_with_session(f"✓ Validation passed: {len(images)} images, coordinates validated", session_id)
 
         # ---------------------------
         # Directories
@@ -223,7 +222,7 @@ async def process_rfp(
         rfp_path = session_upload_dir / rfp_document.filename
         with open(rfp_path, "wb") as f:
             shutil.copyfileobj(rfp_document.file, f)
-        log_with_session(f"📄 Saved RFP document: {rfp_document.filename}", session_id)  # ADDED
+        log_with_session(f"📄 Saved RFP document: {rfp_document.filename}", session_id)
 
         # Save images
         image_paths = []
@@ -232,7 +231,7 @@ async def process_rfp(
             with open(img_path, "wb") as f:
                 shutil.copyfileobj(image.file, f)
             image_paths.append(img_path)
-        log_with_session(f"📸 Saved {len(images)} images", session_id)  # ADDED
+        log_with_session(f"📸 Saved {len(images)} images", session_id)
 
         # ---------------------------
         # Prepare output paths
@@ -261,9 +260,64 @@ async def process_rfp(
         }
 
         # ---------------------------
-        # Parallel tasks: OCR + Images
+        # Start processing in background
         # ---------------------------
-        log_with_session("⚡ Running OCR and image processing in parallel", session_id)  # CHANGED
+        asyncio.create_task(process_rfp_background(
+            session_id=session_id,
+            rfp_path=rfp_path,
+            image_paths=image_paths,
+            coordinate_data=coordinate_data,
+            ocr_output_path=ocr_output_path,
+            classified_images_json_path=classified_images_json_path,
+            chunked_output_path=chunked_output_path,
+            classified_output_path=classified_output_path,
+            inception_pdf_path=inception_pdf_path,
+            processed_images_dir=processed_images_dir
+        ))
+
+        # ---------------------------
+        # Return session ID immediately for redirection
+        # ---------------------------
+        return JSONResponse(
+            status_code=202,
+            content={
+                "message": "RFP processing started successfully",
+                "session_id": session_id,
+                "progress_url": f"/progress/{session_id}",
+                "stream_url": f"/stream-logs/{session_id}",
+                "status": "processing"
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_session(f"❌ Error: {str(e)}", session_id, logging.ERROR)
+        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+
+# ---------------------------
+# Background processing task
+# ---------------------------
+async def process_rfp_background(
+    session_id: str,
+    rfp_path: Path,
+    image_paths: List[Path],
+    coordinate_data: Dict,
+    ocr_output_path: Path,
+    classified_images_json_path: Path,
+    chunked_output_path: Path,
+    classified_output_path: Path,
+    inception_pdf_path: Path,
+    processed_images_dir: Path
+):
+    """Background task to process RFP without blocking the main request"""
+    try:
+        # Start progress logging
+        asyncio.create_task(log_progress(session_id))
+        
+        log_with_session("⚡ Running OCR and image processing in parallel", session_id)
+        
+        # Parallel tasks: OCR + Images
         await asyncio.gather(
             asyncio.to_thread(process_ocr, str(rfp_path), str(ocr_output_path), session_id, progress_store),
             asyncio.to_thread(
@@ -279,18 +333,16 @@ async def process_rfp(
         progress_store[session_id]["images"] = 100.0
 
         if not ocr_output_path.exists():
-            raise HTTPException(status_code=500, detail="OCR processing failed")
+            raise Exception("OCR processing failed")
         if not classified_images_json_path.exists():
-            raise HTTPException(status_code=500, detail="Image classification failed")
+            raise Exception("Image classification failed")
         if not processed_images_dir.exists() or not any(processed_images_dir.iterdir()):
-            raise HTTPException(status_code=500, detail="Image processing failed - no images generated")
+            raise Exception("Image processing failed - no images generated")
 
-        log_with_session("✓ Parallel processing completed", session_id)  # ADDED
+        log_with_session("✓ Parallel processing completed", session_id)
 
-        # ---------------------------
         # Sequential dependent steps
-        # ---------------------------
-        log_with_session("📝 Starting text chunking", session_id)  # ADDED
+        log_with_session("📝 Starting text chunking", session_id)
         progress_store[session_id]["chunking"] = 0.0
         await asyncio.to_thread(
             chunk_text,
@@ -302,15 +354,15 @@ async def process_rfp(
             progress_store=progress_store
         )
         progress_store[session_id]["chunking"] = 100.0
-        log_with_session("✓ Text chunking completed", session_id)  # ADDED
+        log_with_session("✓ Text chunking completed", session_id)
 
-        log_with_session("🏷️ Starting chunk classification", session_id)  # ADDED
+        log_with_session("🏷️ Starting chunk classification", session_id)
         progress_store[session_id]["classification"] = 0.0
         await asyncio.to_thread(classify_chunks, str(chunked_output_path), str(classified_output_path), 5, session_id, progress_store)
         progress_store[session_id]["classification"] = 100.0
-        log_with_session("✓ Chunk classification completed", session_id)  # ADDED
+        log_with_session("✓ Chunk classification completed", session_id)
 
-        log_with_session("📊 Generating inception report", session_id)  # ADDED
+        log_with_session("📊 Generating inception report", session_id)
         progress_store[session_id]["report"] = 0.0
 
         # Create markdown stream handler
@@ -327,23 +379,13 @@ async def process_rfp(
         )
         progress_store[session_id]["report"] = 100.0
         progress_store[session_id]["completed"] = 100.0
-        log_with_session("✅ Processing complete! Report generated", session_id)  # ADDED
+        log_with_session("✅ Processing complete! Report generated", session_id)
 
-        # ---------------------------
-        # Return inception PDF as final output
-        # ---------------------------
-        return FileResponse(
-            path=str(inception_pdf_path),
-            media_type="application/pdf",
-            filename=f"rfp_report_{session_id}.pdf",
-            headers={"Content-Disposition": f"attachment; filename=rfp_report_{session_id}.pdf"}
-        )
-
-    except HTTPException:
-        raise
     except Exception as e:
-        log_with_session(f"❌ Error: {str(e)}", session_id, logging.ERROR)  # CHANGED
-        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+        log_with_session(f"❌ Background processing error: {str(e)}", session_id, logging.ERROR)
+        # Optionally update progress to indicate failure
+        progress_store[session_id]["error"] = str(e)
+        progress_store[session_id]["completed"] = -1  # Indicate failure
 
 # ---------------------------
 # Progress endpoint
@@ -364,14 +406,52 @@ async def download_intermediate_file(session_id: str, file_type: str):
         "chunked": "chunked_output.json",
         "classified": "classified_output.json",
         "inception": "inception.pdf",
-        "classified_images": "classified_images.json"
+        "classified_images": "classified_images.json",
+        "processed_images": "processed_images"
     }
+    
     if file_type not in file_mapping:
         raise HTTPException(status_code=400, detail="Invalid file type")
+    
     file_path = OUTPUT_DIR / session_id / file_mapping[file_type]
+    
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(path=str(file_path), filename=file_mapping[file_type])
+    
+    # Handle directory download (processed images)
+    if file_type == "processed_images" and file_path.is_dir():
+        # Check if directory is empty
+        image_files = [f for f in file_path.iterdir() if f.is_file() and f.suffix.lower() in ['.jpg', '.jpeg', '.png', '.tiff', '.bmp']]
+        
+        if not image_files:
+            raise HTTPException(status_code=404, detail="No processed images found")
+        
+        # Create a zip file of the processed images
+        zip_buffer = BytesIO()
+        try:
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                for image_file in image_files:
+                    # Use arcname to avoid full path in zip
+                    zip_file.write(image_file, arcname=image_file.name)
+            
+            zip_buffer.seek(0)
+            
+            return StreamingResponse(
+                content=zip_buffer,
+                media_type="application/zip",
+                headers={
+                    "Content-Disposition": f"attachment; filename=processed_images_{session_id}.zip"
+                }
+            )
+        except Exception as e:
+            logger.error(f"Error creating zip for session {session_id}: {str(e)}")
+            raise HTTPException(status_code=500, detail="Error creating download package")
+    
+    # Handle single file download
+    return FileResponse(
+        path=str(file_path), 
+        filename=file_mapping[file_type]
+    )
 
 # ---------------------------
 # Get all sessions endpoint
