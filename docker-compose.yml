@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  app:
+    image: "ghcr.io/${OWNER}/${REPO}:${IMAGE_TAG}"
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # example environment variables - these will be read from .env first
+      - UPLOAD_DIR=${UPLOAD_DIR}
+      - OUTPUT_DIR=${OUTPUT_DIR}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - GOOGLE_CSE_ID=${GOOGLE_CSE_ID}
+    ports:
+      - "${HOST_PORT}:${CONTAINER_PORT}"
+    volumes:
+      - ${UPLOAD_DIR}:${UPLOAD_DIR}
+      - ${OUTPUT_DIR}:${OUTPUT_DIR}
+    deploy:
+      resources: {}
