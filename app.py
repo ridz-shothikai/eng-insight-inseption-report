@@ -99,6 +99,18 @@ progress_store: Dict[str, Dict[str, float]] = {}
 #     "report": 0.0, "completed": 0.0
 # }
 
+
+
+def create_markdown_stream_handler(session_id: str):
+    """Create a callback function to handle markdown streaming for a session"""
+    def stream_handler(section_id: str, chunk: str):
+        # Stream markdown chunks via log_streamer
+        log_streamer.broadcast(
+            session_id, 
+            f"MARKDOWN||{section_id}||{chunk}"
+        )
+    return stream_handler
+
 # ---------------------------
 # Startup & Shutdown events
 # ---------------------------
@@ -107,6 +119,28 @@ async def startup_event():
     logger.info("Starting RFP Processing API...")
     cleanup_old_files(OUTPUT_DIR, days=7)
     cleanup_old_files(UPLOAD_DIR, days=7)
+    asyncio.create_task(cleanup_old_progress())
+
+async def cleanup_old_progress():
+    """Cleanup completed sessions from progress_store after 1 hour"""
+    while True:
+        await asyncio.sleep(3600)  # Run every hour
+        current_time = datetime.now()
+        to_remove = []
+        
+        for session_id, progress in progress_store.items():
+            if progress.get("completed", 0) >= 100:
+                # Extract timestamp from session_id
+                try:
+                    session_time = datetime.strptime(session_id[:15], "%Y%m%d_%H%M%S")
+                    if (current_time - session_time).total_seconds() > 3600:  # 1 hour old
+                        to_remove.append(session_id)
+                except:
+                    pass
+        
+        for session_id in to_remove:
+            progress_store.pop(session_id, None)
+            logger.info(f"Cleaned up old progress for session: {session_id}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -264,13 +298,18 @@ async def process_rfp(
 
         log_with_session("📊 Generating inception report", session_id)  # ADDED
         progress_store[session_id]["report"] = 0.0
+
+        # Create markdown stream handler
+        markdown_stream_handler = create_markdown_stream_handler(session_id)
+
         await asyncio.to_thread(
             generate_inception_report,
             str(classified_output_path),
             str(inception_pdf_path),
             str(ocr_output_path),
             session_id,
-            progress_store
+            progress_store,
+            stream_callback=markdown_stream_handler
         )
         progress_store[session_id]["report"] = 100.0
         progress_store[session_id]["completed"] = 100.0
@@ -388,7 +427,7 @@ async def get_session_details(session_id: str):
 # ---------------------------
 @app.get("/stream-logs/{session_id}")
 async def stream_logs(session_id: str):
-    """Stream logs and progress for a specific session using Server-Sent Events"""
+    """Stream logs, progress, and markdown for a specific session using Server-Sent Events"""
     
     async def event_generator():
         queue = log_streamer.add_client(session_id)
@@ -405,17 +444,34 @@ async def stream_logs(session_id: str):
                 try:
                     # Wait for logs with timeout
                     log_message = await asyncio.wait_for(queue.get(), timeout=0.5)
+                    
+                    # Check if this is a markdown stream message
+                    if log_message.startswith("MARKDOWN||"):
+                        # Parse markdown stream: "MARKDOWN||section_id||chunk"
+                        parts = log_message.split("||", 2)
+                        if len(parts) == 3:
+                            yield {
+                                "event": "markdown",
+                                "data": json.dumps({
+                                    "section_id": parts[1],
+                                    "chunk": parts[2]
+                                })
+                            }
+                            continue
+                    
+                    # Regular log message
                     yield {
                         "event": "log",
                         "data": json.dumps({"message": log_message})
                     }
+                    
                 except asyncio.TimeoutError:
                     # No log received, send progress update instead
                     if session_id in progress_store:
                         current_progress = progress_store[session_id]
                         if current_progress != last_progress:
                             yield {
-                                "event": "progress",
+                                "event": "progress", 
                                 "data": json.dumps(current_progress)
                             }
                             last_progress = current_progress.copy()

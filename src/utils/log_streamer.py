@@ -2,12 +2,11 @@ import logging
 import asyncio
 from collections import defaultdict
 from typing import Dict, Set
-from queue import Queue
 
 class LogStreamer:
     def __init__(self):
         self.session_queues: Dict[str, Set[asyncio.Queue]] = defaultdict(set)
-        
+    
     def add_client(self, session_id: str) -> asyncio.Queue:
         """Add a client queue for a session"""
         queue = asyncio.Queue(maxsize=100)
@@ -20,6 +19,22 @@ class LogStreamer:
             self.session_queues[session_id].discard(queue)
             if not self.session_queues[session_id]:
                 del self.session_queues[session_id]
+    
+    def broadcast(self, session_id: str, message: str):
+        """
+        Synchronous broadcast method for sending messages from non-async contexts.
+        This is used by the markdown streaming callback.
+        """
+        if session_id in self.session_queues:
+            # Get list of queues to avoid modification during iteration
+            queues = list(self.session_queues[session_id])
+            for queue in queues:
+                try:
+                    # Use put_nowait for synchronous non-blocking put
+                    queue.put_nowait(message)
+                except asyncio.QueueFull:
+                    # If queue is full, skip this message (don't block)
+                    pass
     
     async def send_log(self, session_id: str, message: str):
         """Send log message to all clients subscribed to this session"""
@@ -38,11 +53,10 @@ log_streamer = LogStreamer()
 
 class SessionLogHandler(logging.Handler):
     """Custom handler that streams logs to clients"""
-    
     def __init__(self, streamer: LogStreamer):
         super().__init__()
         self.streamer = streamer
-        
+    
     def emit(self, record):
         try:
             log_entry = self.format(record)
