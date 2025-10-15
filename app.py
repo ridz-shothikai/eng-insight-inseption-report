@@ -119,7 +119,10 @@ async def startup_event():
     logger.info("Starting RFP Processing API...")
     cleanup_old_files(OUTPUT_DIR, days=7)
     cleanup_old_files(UPLOAD_DIR, days=7)
+    
+    # Start background tasks
     asyncio.create_task(cleanup_old_progress())
+    asyncio.create_task(cleanup_old_history()) 
 
 async def cleanup_old_progress():
     """Cleanup completed sessions from progress_store after 1 hour"""
@@ -141,6 +144,17 @@ async def cleanup_old_progress():
         for session_id in to_remove:
             progress_store.pop(session_id, None)
             logger.info(f"Cleaned up old progress for session: {session_id}")
+
+async def cleanup_old_history():
+    """Cleanup old log history periodically"""
+    while True:
+        await asyncio.sleep(3600)  # Run every hour
+        try:
+            removed = log_streamer.cleanup_old_history()
+            if removed > 0:
+                logger.info(f"Cleaned up history for {removed} old sessions")
+        except Exception as e:
+            logger.error(f"Error cleaning up history: {e}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -506,7 +520,11 @@ async def cleanup_session(session_id: str):
         for dir_path in session_dirs:
             if dir_path.exists():
                 shutil.rmtree(dir_path)
+        
+        # Clean up in-memory stores
         progress_store.pop(session_id, None)
+        log_streamer.clear_history(session_id)  # ADD THIS LINE
+        
         logger.info(f"Cleaned up session: {session_id}")
         return {"message": f"Session {session_id} cleaned up successfully"}
     except Exception as e:
