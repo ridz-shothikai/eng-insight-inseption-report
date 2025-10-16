@@ -99,6 +99,16 @@ progress_store: Dict[str, Dict[str, float]] = {}
 #     "report": 0.0, "completed": 0.0
 # }
 
+# ---------------------------
+# In-memory markdown store
+# ---------------------------
+markdown_store: Dict[str, Dict[str, str]] = {}
+# Structure: markdown_store[session_id] = {
+#     "executive_summary": "markdown content...",
+#     "introduction": "markdown content...",
+#     ...
+# }
+
 
 
 def create_markdown_stream_handler(session_id: str):
@@ -110,6 +120,18 @@ def create_markdown_stream_handler(session_id: str):
             f"MARKDOWN||{section_id}||{chunk}"
         )
     return stream_handler
+
+
+def create_markdown_accumulator(session_id: str, store: Dict[str, Dict[str, str]]):
+    """Creates a callback that accumulates markdown instead of streaming"""
+    def accumulate_markdown(section_id: str, chunk: str):
+        if session_id not in store:
+            store[session_id] = {}
+        if section_id not in store[session_id]:
+            store[session_id][section_id] = ""
+        store[session_id][section_id] += chunk
+    
+    return accumulate_markdown
 
 # ---------------------------
 # Startup & Shutdown events
@@ -253,6 +275,8 @@ async def process_rfp(
             "report": 0.0,
             "completed": 0.0
         }
+
+        markdown_store[session_id] = {} 
 
         coordinate_data = {
             "start": {"latitude": start_latitude, "longitude": start_longitude},
@@ -585,6 +609,59 @@ async def fetch_markdown(session_id: str):
     
     return EventSourceResponse(event_generator())
 
+
+# ---------------------------
+# Get complete markdown endpoint (non-streaming)
+# ---------------------------
+@app.get("/get_markdown/{session_id}")
+async def get_markdown(session_id: str):
+    """Fetch complete accumulated markdown for a session"""
+    
+    if session_id not in markdown_store:
+        raise HTTPException(status_code=404, detail="Session not found or no markdown generated yet")
+    
+    markdown_data = markdown_store[session_id]
+    
+    if not markdown_data:
+        raise HTTPException(status_code=404, detail="No markdown data available yet")
+    
+    section_order = [
+        "executive_summary", "introduction", "site_appreciation", "methodology",
+        "task_assignment", "cross_sections", "design_standards", "work_programme",
+        "development", "quality_assurance", "checklists", "summary_conclusion", "compliances",
+        "appendix_irc_codes", "appendix_monsoon", "appendix_equipment",
+        "appendix_testing", "appendix_compliance_matrix"
+    ]
+    
+    # Build full markdown
+    full_markdown = ""
+    completed_sections = 0
+    
+    for section_id in section_order:
+        if section_id in markdown_data and markdown_data[section_id].strip():
+            full_markdown += markdown_data[section_id] + "\n\n"
+            completed_sections += 1
+    
+    # Get progress from progress_store if available
+    report_progress = 0
+    is_complete = False
+    if session_id in progress_store:
+        report_progress = progress_store[session_id].get("report", 0)
+        is_complete = progress_store[session_id].get("completed", 0) >= 100
+    
+    return {
+        "session_id": session_id,
+        "markdown": full_markdown.strip(),
+        "sections": markdown_data,
+        "progress": {
+            "completed_sections": completed_sections,
+            "total_sections": len(section_order),
+            "percentage": (completed_sections / len(section_order)) * 100,
+            "report_progress": report_progress,
+            "is_complete": is_complete
+        }
+    }
+
 # ---------------------------
 # Cleanup session files
 # ---------------------------
@@ -602,7 +679,8 @@ async def cleanup_session(session_id: str):
         
         # Clean up in-memory stores
         progress_store.pop(session_id, None)
-        log_streamer.clear_history(session_id)  # ADD THIS LINE
+        markdown_store.pop(session_id, None)
+        log_streamer.clear_history(session_id)
         
         logger.info(f"Cleaned up session: {session_id}")
         return {"message": f"Session {session_id} cleaned up successfully"}
