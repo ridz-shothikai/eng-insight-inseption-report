@@ -194,7 +194,7 @@ async def health_check():
 # ---------------------------
 async def log_progress(session_id: str):
     while session_id in progress_store and progress_store[session_id]["completed"] < 100.0:
-        log_with_session(f"Progress: {progress_store[session_id]}", session_id)  # CHANGED
+        log_with_session(f"Progress: {progress_store[session_id]}", session_id)
         await asyncio.sleep(5)  # log every 5 seconds
 
 @app.post("/process-rfp")

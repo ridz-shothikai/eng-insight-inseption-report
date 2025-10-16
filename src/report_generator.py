@@ -173,7 +173,14 @@ class ContentGenerator:
             raise ValueError("GOOGLE_API_KEY not found in environment variables")
         
         genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel("gemini-2.5-flash")
+        
+            # Primary and fallback models
+        self.primary_model_name = "gemini-2.5-flash"
+        self.fallback_model_name = "gemini-2.5-flash-lite"  # Weaker/cheaper model
+        
+        self.model = genai.GenerativeModel(self.primary_model_name)
+        self.fallback_model = genai.GenerativeModel(self.fallback_model_name)
+
         self.location = location
         self.session_id = session_id
         self.search_tool = GoogleSearchTool(session_id=session_id)
@@ -200,6 +207,7 @@ class ContentGenerator:
         # ]
         
         log_with_session(f"ContentGenerator initialized for location: {location}", session_id)
+        log_with_session(f"Primary model: {self.primary_model_name}, Fallback: {self.fallback_model_name}", session_id)
 
     def update_progress(self, value: float):
         if self.progress_callback:
@@ -251,18 +259,17 @@ Generate comprehensive, technical content suitable for a professional engineerin
         return prompt
 
     def _generate_with_streaming(self, prompt: str, section_id: str, max_retries: int = 3) -> str:
+        # Try primary model first
         for attempt in range(max_retries + 1):
             try:
                 time.sleep(1.0)
                 full_response = ""
                 
-                # Use streaming API
                 response = self.model.generate_content(prompt, stream=True)
                 
                 for chunk in response:
                     if chunk.text:
                         full_response += chunk.text
-                        # Stream each chunk to the callback
                         if self.stream_callback:
                             self.stream_callback(section_id, chunk.text)
                 
@@ -271,18 +278,50 @@ Generate comprehensive, technical content suitable for a professional engineerin
             except Exception as e:
                 if "429" in str(e) or "rateLimit" in str(e):
                     if attempt < max_retries:
-                        log_with_session(f"⏱️ Rate limited. Retrying in 30s... (attempt {attempt+1})", self.session_id, logging.WARNING)
+                        log_with_session(f"⏱️ Rate limited on {self.primary_model_name}. Retrying in 30s... (attempt {attempt+1})", self.session_id, logging.WARNING)
                         time.sleep(30)
                     else:
-                        log_with_session("❌ Max retries exceeded for rate limit", self.session_id, logging.ERROR)
-                        raise e
+                        log_with_session(f"⚠️ Max retries exceeded on {self.primary_model_name}, falling back to {self.fallback_model_name}", self.session_id, logging.WARNING)
+                        break  # Exit to try fallback model
                 else:
-                    log_with_session(f"❌ Content generation error: {e}", self.session_id, logging.ERROR)
+                    log_with_session(f"❌ Content generation error on {self.primary_model_name}: {e}", self.session_id, logging.ERROR)
+                    break  # Exit to try fallback model
+        
+        # Fallback to weaker model
+        log_with_session(f"🔄 Attempting with fallback model: {self.fallback_model_name}", self.session_id, logging.INFO)
+        
+        for attempt in range(max_retries + 1):
+            try:
+                time.sleep(1.0)
+                full_response = ""
+                
+                response = self.fallback_model.generate_content(prompt, stream=True)
+                
+                for chunk in response:
+                    if chunk.text:
+                        full_response += chunk.text
+                        if self.stream_callback:
+                            self.stream_callback(section_id, chunk.text)
+                
+                log_with_session(f"✅ Successfully generated with fallback model: {self.fallback_model_name}", self.session_id)
+                return full_response.strip()
+                
+            except Exception as e:
+                if "429" in str(e) or "rateLimit" in str(e):
+                    if attempt < max_retries:
+                        log_with_session(f"⏱️ Rate limited on {self.fallback_model_name}. Retrying in 30s... (attempt {attempt+1})", self.session_id, logging.WARNING)
+                        time.sleep(30)
+                    else:
+                        log_with_session(f"❌ Max retries exceeded on fallback model {self.fallback_model_name}", self.session_id, logging.ERROR)
+                        raise Exception(f"Failed to generate content with both primary and fallback models")
+                else:
+                    log_with_session(f"❌ Content generation error on {self.fallback_model_name}: {e}", self.session_id, logging.ERROR)
                     raise e
 
-    # Then REPLACE the existing _generate_with_retry method:
+    
     def _generate_with_retry(self, prompt: str, max_retries: int = 3) -> str:
-        """Non-streaming fallback - keep this but modify generate_section to use streaming"""
+        """Non-streaming fallback"""
+        # Try primary model
         for attempt in range(max_retries + 1):
             try:
                 time.sleep(1.0)
@@ -291,13 +330,34 @@ Generate comprehensive, technical content suitable for a professional engineerin
             except Exception as e:
                 if "429" in str(e) or "rateLimit" in str(e):
                     if attempt < max_retries:
-                        log_with_session(f"⏱️ Rate limited. Retrying in 30s... (attempt {attempt+1})", self.session_id, logging.WARNING)
+                        log_with_session(f"⏱️ Rate limited on {self.primary_model_name}. Retrying in 30s... (attempt {attempt+1})", self.session_id, logging.WARNING)
                         time.sleep(30)
                     else:
-                        log_with_session("❌ Max retries exceeded for rate limit", self.session_id, logging.ERROR)
-                        raise e
+                        log_with_session(f"⚠️ Max retries exceeded on {self.primary_model_name}, falling back to {self.fallback_model_name}", self.session_id, logging.WARNING)
+                        break
                 else:
-                    log_with_session(f"❌ Content generation error: {e}", self.session_id, logging.ERROR)
+                    log_with_session(f"❌ Content generation error on {self.primary_model_name}: {e}", self.session_id, logging.ERROR)
+                    break
+        
+        # Fallback to weaker model
+        log_with_session(f"🔄 Attempting with fallback model: {self.fallback_model_name}", self.session_id, logging.INFO)
+        
+        for attempt in range(max_retries + 1):
+            try:
+                time.sleep(1.0)
+                response = self.fallback_model.generate_content(prompt)
+                log_with_session(f"✅ Successfully generated with fallback model: {self.fallback_model_name}", self.session_id)
+                return response.text.strip()
+            except Exception as e:
+                if "429" in str(e) or "rateLimit" in str(e):
+                    if attempt < max_retries:
+                        log_with_session(f"⏱️ Rate limited on {self.fallback_model_name}. Retrying in 30s... (attempt {attempt+1})", self.session_id, logging.WARNING)
+                        time.sleep(30)
+                    else:
+                        log_with_session(f"❌ Max retries exceeded on fallback model {self.fallback_model_name}", self.session_id, logging.ERROR)
+                        raise Exception(f"Failed to generate content with both primary and fallback models")
+                else:
+                    log_with_session(f"❌ Content generation error on {self.fallback_model_name}: {e}", self.session_id, logging.ERROR)
                     raise e
 
     def generate_section(self, category: str, chunks: List[TextChunk]) -> ReportSection:
@@ -881,7 +941,10 @@ def extract_location(input_file: str, session_id: str = None) -> str:
         return "Unspecified location in India"
 
     genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-    model = genai.GenerativeModel("gemini-2.5-flash")
+    
+    # Initialize both models
+    primary_model = genai.GenerativeModel("gemini-2.5-flash")
+    fallback_model = genai.GenerativeModel("gemini-2.5-flash-lite")
     
     prompt = f"""Extract ONLY the primary city/place from the text for a road/highway/bridge project in India.
 
@@ -891,14 +954,25 @@ Text:
 Respond with just the location name, nothing else.
 Location:"""
     
+    # Try primary model
     try:
-        location = model.generate_content(prompt).text.strip()
+        location = primary_model.generate_content(prompt).text.strip()
         if not location or len(location) < 3:
             return "Unspecified location in India"
         return location
     except Exception as e:
-        log_with_session(f"❌ Location extraction failed: {e}", session_id, logging.ERROR)
-        return "Unspecified location in India"
+        log_with_session(f"⚠️ Location extraction failed with primary model, trying fallback: {e}", session_id, logging.WARNING)
+        
+        # Try fallback model
+        try:
+            location = fallback_model.generate_content(prompt).text.strip()
+            if not location or len(location) < 3:
+                return "Unspecified location in India"
+            log_with_session(f"✅ Location extracted with fallback model", session_id)
+            return location
+        except Exception as fallback_e:
+            log_with_session(f"❌ Location extraction failed with both models: {fallback_e}", session_id, logging.ERROR)
+            return "Unspecified location in India"
 
 
 def enhance_location(location: str, session_id: str = None) -> str:
@@ -912,7 +986,10 @@ def enhance_location(location: str, session_id: str = None) -> str:
     context = "\n".join([r.get("snippet", "") for r in results.get("results", [])[:3]])
 
     genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-    model = genai.GenerativeModel("gemini-2.5-flash")
+    
+    # Initialize both models
+    primary_model = genai.GenerativeModel("gemini-2.5-flash")
+    fallback_model = genai.GenerativeModel("gemini-2.5-flash-lite")
     
     prompt = f"""Enhance location into format 'City, District, State' for India.
 
@@ -924,14 +1001,25 @@ Search Results:
 Respond with just the enhanced location in format: City, District, State
 Enhanced Location:"""
     
+    # Try primary model
     try:
-        enhanced = model.generate_content(prompt).text.strip()
+        enhanced = primary_model.generate_content(prompt).text.strip()
         if enhanced and "," in enhanced:
             return enhanced
         return location
     except Exception as e:
-        log_with_session(f"❌ Location enhancement failed: {e}", session_id, logging.ERROR)
-        return location
+        log_with_session(f"⚠️ Location enhancement failed with primary model, trying fallback: {e}", session_id, logging.WARNING)
+        
+        # Try fallback model
+        try:
+            enhanced = fallback_model.generate_content(prompt).text.strip()
+            if enhanced and "," in enhanced:
+                log_with_session(f"✅ Location enhanced with fallback model", session_id)
+                return enhanced
+            return location
+        except Exception as fallback_e:
+            log_with_session(f"❌ Location enhancement failed with both models: {fallback_e}", session_id, logging.ERROR)
+            return location
 
 
 def generate_inception_report(
