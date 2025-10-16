@@ -284,7 +284,6 @@ async def process_rfp(
                 "message": "RFP processing started successfully",
                 "session_id": session_id,
                 "progress_url": f"/progress/{session_id}",
-                "stream_url": f"/stream-logs/{session_id}",
                 "status": "processing"
             }
         )
@@ -519,8 +518,8 @@ async def get_session_details(session_id: str):
 # ---------------------------
 # Log streaming endpoint (SSE)
 # ---------------------------
-@app.get("/stream-logs/{session_id}")
-async def stream_logs(session_id: str):
+@app.get("/fetch_markdown/{session_id}")
+async def fetch_markdown(session_id: str):
     """Stream logs, progress, and markdown for a specific session using Server-Sent Events"""
     
     async def event_generator():
