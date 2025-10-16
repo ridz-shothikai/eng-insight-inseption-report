@@ -175,7 +175,7 @@ class ContentGenerator:
         genai.configure(api_key=api_key)
         
             # Primary and fallback models
-        self.primary_model_name = "gemini-2.5-flash"
+        self.primary_model_name = "gemini-2.5-flash-lite"
         self.fallback_model_name = "gemini-2.5-flash-lite"  # Weaker/cheaper model
         
         self.model = genai.GenerativeModel(self.primary_model_name)
@@ -943,7 +943,7 @@ def extract_location(input_file: str, session_id: str = None) -> str:
     genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
     
     # Initialize both models
-    primary_model = genai.GenerativeModel("gemini-2.5-flash")
+    primary_model = genai.GenerativeModel("gemini-2.5-flash-lite")
     fallback_model = genai.GenerativeModel("gemini-2.5-flash-lite")
     
     prompt = f"""Extract ONLY the primary city/place from the text for a road/highway/bridge project in India.
@@ -988,7 +988,7 @@ def enhance_location(location: str, session_id: str = None) -> str:
     genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
     
     # Initialize both models
-    primary_model = genai.GenerativeModel("gemini-2.5-flash")
+    primary_model = genai.GenerativeModel("gemini-2.5-flash-lite")
     fallback_model = genai.GenerativeModel("gemini-2.5-flash-lite")
     
     prompt = f"""Enhance location into format 'City, District, State' for India.
@@ -1108,7 +1108,7 @@ def generate_inception_report(
         image_base_dir = classified_path.parent
 
         image_json_path = image_base_dir / "classified_images.json"
-        
+
         if image_json_path.exists():
             try:
                 with open(image_json_path, "r", encoding="utf-8") as f:
