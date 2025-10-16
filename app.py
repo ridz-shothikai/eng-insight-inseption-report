@@ -112,26 +112,22 @@ markdown_store: Dict[str, Dict[str, str]] = {}
 
 
 def create_markdown_stream_handler(session_id: str):
-    """Create a callback function to handle markdown streaming for a session"""
+    """Create a callback function to handle markdown streaming AND accumulation for a session"""
     def stream_handler(section_id: str, chunk: str):
-        # Stream markdown chunks via log_streamer
+        # Accumulate markdown in store
+        if session_id not in markdown_store:
+            markdown_store[session_id] = {}
+        if section_id not in markdown_store[session_id]:
+            markdown_store[session_id][section_id] = ""
+        markdown_store[session_id][section_id] += chunk
+        
+        # Also stream it via log_streamer for real-time display
         log_streamer.broadcast(
             session_id, 
             f"MARKDOWN||{section_id}||{chunk}"
         )
     return stream_handler
 
-
-def create_markdown_accumulator(session_id: str, store: Dict[str, Dict[str, str]]):
-    """Creates a callback that accumulates markdown instead of streaming"""
-    def accumulate_markdown(section_id: str, chunk: str):
-        if session_id not in store:
-            store[session_id] = {}
-        if section_id not in store[session_id]:
-            store[session_id][section_id] = ""
-        store[session_id][section_id] += chunk
-    
-    return accumulate_markdown
 
 # ---------------------------
 # Startup & Shutdown events
