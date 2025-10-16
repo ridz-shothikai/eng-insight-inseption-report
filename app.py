@@ -406,6 +406,47 @@ async def process_rfp_background(
         progress_store[session_id]["error"] = str(e)
         progress_store[session_id]["completed"] = -1  # Indicate failure
 
+
+############################
+#add image url endpoint
+############################
+
+@app.get("/route-url/{session_id}")
+async def get_route_url(session_id: str):
+    """Get the Google Maps route image URL for a session"""
+    try:
+        # Check if session exists
+        if session_id not in progress_store:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Path to the classified images JSON
+        classified_images_path = OUTPUT_DIR / session_id / "classified_images.json"
+        
+        if not classified_images_path.exists():
+            raise HTTPException(status_code=404, detail="Route data not found for this session")
+        
+        # Load the JSON data
+        with open(classified_images_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # Extract route URL
+        route_url = data.get("route_image_url")
+        
+        if not route_url:
+            raise HTTPException(status_code=404, detail="Route URL not available")
+        
+        return {
+            "session_id": session_id,
+            "route_image_url": route_url,
+            "message": "Route URL retrieved successfully"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting route URL for session {session_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving route URL: {str(e)}")
+
 # ---------------------------
 # Progress endpoint
 # ---------------------------

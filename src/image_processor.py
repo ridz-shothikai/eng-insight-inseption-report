@@ -161,20 +161,20 @@ def get_route_image(
             "path": f"color:0x0000ff|weight:5|{path}",
             "key": api_key
         }
+
+        base_url = "https://maps.googleapis.com/maps/api/staticmap"
+        query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+        route_image_url = f"{base_url}?{query_string}"
         
-        resp = requests.get(
-            "https://maps.googleapis.com/maps/api/staticmap",
-            params=params,
-            timeout=30
-        )
+        resp = requests.get(route_image_url, timeout=30)
         
         if resp.status_code == 200:
             logger.info(f"Route map image generated successfully")
             img = Image.open(BytesIO(resp.content))
-            return img
+            return img, route_image_url  # Return both image and URL
         else:
             logger.warning(f"Failed to fetch route image: {resp.status_code}")
-            return None
+            return None, None
     
     except Exception as e:
         logger.error(f"Error generating route image: {e}")
@@ -391,6 +391,14 @@ def add_metadata_to_image(
         # Convert to RGB if necessary
         if img.mode != 'RGB':
             img = img.convert('RGB')
+
+        # Standardize image size (pad to 1920x1080)
+        img = ImageOps.pad(
+            img,
+            (2560, 1440),
+            method=Image.Resampling.LANCZOS,
+            color=(255, 255, 255)  # White background for padding
+        )
         
         # Simply save the image without any overlay
         img.save(output_path, quality=95)
@@ -429,11 +437,12 @@ def process_images(
         
         # --- Generate route map if coordinates provided ---
         all_image_paths = list(image_paths)  # Start with user images
+        route_image_url = None 
         
         if coordinate_data and "start" in coordinate_data and "end" in coordinate_data:
             start = coordinate_data["start"]
             end = coordinate_data["end"]
-            route_img = get_route_image(
+            route_img, route_image_url = get_route_image(  # Now returns both image and URL
                 start["latitude"], start["longitude"],
                 end["latitude"], end["longitude"]
             )
@@ -455,6 +464,13 @@ def process_images(
                 route_img.save(route_image_path, quality=95)
                 all_image_paths.insert(0, str(route_image_path))  # Process first
                 logger.info(f"Route map saved: {route_image_path}")
+
+                # Store the route URL in a separate file
+                if route_image_url:
+                    route_url_path = output_path / "route_image_url.txt"
+                    with open(route_url_path, 'w') as f:
+                        f.write(route_image_url)
+                    logger.info(f"Route URL saved: {route_url_path}")
             else:
                 logger.warning("Failed to generate route map")
         
@@ -513,10 +529,14 @@ def process_images(
             logger.info(f"Session {session_id}: Image {idx + 1}/{total_to_process} processed")
             logger.info(f"  Category: {category}")
             logger.info(f"  Caption: {caption}")
+
+        result_data = {
+            "images": processed_results,
+            "route_image_url": route_image_url  # Add route URL to results
+        }
         
-        # Save classification results
         with open(classified_images_json_path, 'w', encoding='utf-8') as f:
-            json.dump(processed_results, f, indent=2, ensure_ascii=False)
+            json.dump(result_data, f, indent=2, ensure_ascii=False)
         
         logger.info(f"Session {session_id}: All images processed. Results saved to {classified_images_json_path}")
         logger.info(f"Session {session_id}: Processed images saved to {output_dir}")
