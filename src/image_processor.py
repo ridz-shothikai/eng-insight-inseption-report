@@ -137,7 +137,7 @@ def get_route_image(
     end_lat: float, 
     end_lng: float, 
     size: str = "1920x1080"
-) -> Optional[Image.Image]:
+) -> Optional[Tuple[Optional[Image.Image], Optional[str]]]:
     """Generate route map image using Google Static Maps API"""
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
@@ -178,7 +178,7 @@ def get_route_image(
     
     except Exception as e:
         logger.error(f"Error generating route image: {e}")
-        return None
+        return None, None
 
 
 # ---------------- Image Classifier ---------------- #
@@ -264,6 +264,87 @@ Analyze this image and provide a brief, descriptive caption (maximum 10-12 words
 Caption:"""
         
         return prompt
+    
+    def classify_image(self, image_path: str, max_retries: int = 3) -> str:
+        """
+        Classify a single image into one of the predefined categories with fallback support
+        
+        Args:
+            image_path: Path to the image file
+            max_retries: Maximum number of retry attempts per model
+            
+        Returns:
+            Category name as string
+        """
+        img = self._load_image_for_classification(image_path)
+        if not img:
+            logger.warning(f"Could not load image for classification")
+            return "uncategorized"
+        
+        prompt = self._build_classification_prompt()
+        
+        # Try primary model first
+        for attempt in range(max_retries):
+            try:
+                time.sleep(1)
+                response = self.model.generate_content([prompt, img])
+                category = response.text.strip().lower()
+                
+                # Validate category
+                if category in IMAGE_CATEGORIES:
+                    logger.info(f"✓ Classified: {Path(image_path).name} → {category}")
+                    return category
+                else:
+                    logger.warning(f"Invalid category '{category}', using closest match")
+                    # Try to find closest match
+                    for valid_cat in IMAGE_CATEGORIES.keys():
+                        if valid_cat in category or category in valid_cat:
+                            return valid_cat
+                    return "uncategorized"
+                    
+            except Exception as e:
+                if "429" in str(e) or "quota" in str(e).lower():
+                    wait_time = 30 * (attempt + 1)
+                    logger.warning(f"Rate limited on {self.primary_model_name}. Waiting {wait_time}s... (attempt {attempt + 1})")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Classification error on {self.primary_model_name}: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(5)
+        
+        # Fallback to weaker model
+        logger.warning(f"⚠️ Primary model failed, trying fallback: {self.fallback_model_name}")
+        
+        for attempt in range(max_retries):
+            try:
+                time.sleep(1)
+                response = self.fallback_model.generate_content([prompt, img])
+                category = response.text.strip().lower()
+                
+                # Validate category
+                if category in IMAGE_CATEGORIES:
+                    logger.info(f"✓ Classified with fallback: {Path(image_path).name} → {category}")
+                    return category
+                else:
+                    logger.warning(f"Invalid category '{category}', using closest match")
+                    for valid_cat in IMAGE_CATEGORIES.keys():
+                        if valid_cat in category or category in valid_cat:
+                            return valid_cat
+                    return "uncategorized"
+                    
+            except Exception as e:
+                if "429" in str(e) or "quota" in str(e).lower():
+                    wait_time = 30 * (attempt + 1)
+                    logger.warning(f"Rate limited on {self.fallback_model_name}. Waiting {wait_time}s... (attempt {attempt + 1})")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Classification error on {self.fallback_model_name}: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(5)
+        
+        # Ultimate fallback
+        logger.warning(f"All models failed for classification")
+        return "uncategorized"
     
     def generate_caption(self, image_path: str, max_retries: int = 3) -> str:
         """
