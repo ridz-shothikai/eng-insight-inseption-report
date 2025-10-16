@@ -482,7 +482,21 @@ async def download_intermediate_file(session_id: str, file_type: str):
     if file_type not in file_mapping:
         raise HTTPException(status_code=400, detail="Invalid file type")
     
-    file_path = OUTPUT_DIR / session_id / file_mapping[file_type]
+    # SPECIAL CASE: For "inception" file type - try session-specific first, then static fallback
+    if file_type == "inception":
+        # First try session-specific file
+        session_file_path = OUTPUT_DIR / session_id / "inception.pdf"
+        if session_file_path.exists():
+            file_path = session_file_path
+        else:
+            # Fallback to static file
+            file_path = BASE_DIR / "inception" / "inception.pdf"
+            if not file_path.exists():
+                raise HTTPException(status_code=404, detail="Inception PDF not found")
+    
+    # For all other file types, use the session-specific files
+    else:
+        file_path = OUTPUT_DIR / session_id / file_mapping[file_type]
     
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
@@ -516,10 +530,10 @@ async def download_intermediate_file(session_id: str, file_type: str):
     # Handle single file download with proper media type
     return FileResponse(
         path=str(file_path), 
-        filename=file_mapping[file_type],
-        media_type=media_type_mapping.get(file_type, "application/octet-stream"),  # Add media type
+        filename=file_path.name,  # Use actual file name to handle both session and static files
+        media_type=media_type_mapping.get(file_type, "application/octet-stream"),
         headers={
-            "Content-Disposition": f"attachment; filename={file_mapping[file_type]}"  # Force download
+            "Content-Disposition": f"attachment; filename={file_path.name}"
         }
     )
 
