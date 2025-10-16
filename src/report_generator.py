@@ -1108,13 +1108,28 @@ def generate_inception_report(
         image_base_dir = classified_path.parent
 
         image_json_path = image_base_dir / "classified_images.json"
+        
         if image_json_path.exists():
             try:
                 with open(image_json_path, "r", encoding="utf-8") as f:
-                    image_data = json.load(f)
+                    raw_data = json.load(f)
+                
+                # Extract the list of image entries
+                if isinstance(raw_data, dict) and "images" in raw_data:
+                    image_data = raw_data["images"]
+                elif isinstance(raw_data, list):
+                    # Fallback if old format was used
+                    image_data = raw_data
+                else:
+                    image_data = []
+                    log_with_session("⚠️ Unexpected format in classified_images.json", session_id, logging.WARNING)
+
                 log_with_session(f"📸 Loaded {len(image_data)} images from {image_json_path}", session_id)
             except Exception as e:
                 log_with_session(f"⚠️ Failed to load image data: {e}", session_id, logging.WARNING)
+                image_data = []
+        else:
+            image_data = []
 
         # Create PDF with images
         create_pdf_report(
