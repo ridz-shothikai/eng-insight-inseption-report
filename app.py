@@ -470,6 +470,15 @@ async def download_intermediate_file(session_id: str, file_type: str):
         "processed_images": "processed_images"
     }
     
+    # Add media type mapping for proper content type headers
+    media_type_mapping = {
+        "ocr": "text/plain",
+        "chunked": "application/json",
+        "classified": "application/json",
+        "inception": "application/pdf",
+        "classified_images": "application/json"
+    }
+    
     if file_type not in file_mapping:
         raise HTTPException(status_code=400, detail="Invalid file type")
     
@@ -480,18 +489,15 @@ async def download_intermediate_file(session_id: str, file_type: str):
     
     # Handle directory download (processed images)
     if file_type == "processed_images" and file_path.is_dir():
-        # Check if directory is empty
         image_files = [f for f in file_path.iterdir() if f.is_file() and f.suffix.lower() in ['.jpg', '.jpeg', '.png', '.tiff', '.bmp']]
         
         if not image_files:
             raise HTTPException(status_code=404, detail="No processed images found")
         
-        # Create a zip file of the processed images
         zip_buffer = BytesIO()
         try:
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
                 for image_file in image_files:
-                    # Use arcname to avoid full path in zip
                     zip_file.write(image_file, arcname=image_file.name)
             
             zip_buffer.seek(0)
@@ -507,10 +513,14 @@ async def download_intermediate_file(session_id: str, file_type: str):
             logger.error(f"Error creating zip for session {session_id}: {str(e)}")
             raise HTTPException(status_code=500, detail="Error creating download package")
     
-    # Handle single file download
+    # Handle single file download with proper media type
     return FileResponse(
         path=str(file_path), 
-        filename=file_mapping[file_type]
+        filename=file_mapping[file_type],
+        media_type=media_type_mapping.get(file_type, "application/octet-stream"),  # Add media type
+        headers={
+            "Content-Disposition": f"attachment; filename={file_mapping[file_type]}"  # Force download
+        }
     )
 
 # ---------------------------
