@@ -296,15 +296,6 @@ async def process_rfp(
         log_with_session(f"📸 Saved {len(images)} images", session_id)
 
         # ---------------------------
-        # Prepare output paths
-        # ---------------------------
-        ocr_output_path = session_output_dir / "ocr_output.txt"
-        classified_images_json_path = session_output_dir / "classified_images.json"
-        chunked_output_path = session_output_dir / "chunked_output.json"
-        classified_output_path = session_output_dir / "classified_output.json"
-        inception_pdf_path = session_output_dir / "inception.pdf"
-
-        # ---------------------------
         # Initialize progress
         # ---------------------------
         progress_store[session_id] = {
@@ -323,6 +314,9 @@ async def process_rfp(
             "end": {"latitude": end_latitude, "longitude": end_longitude}
         }
 
+        # ---------------------------
+        # CREATE SESSION IN MONGODB FIRST (BEFORE BACKGROUND PROCESSING)
+        # ---------------------------
         session_data = {
             "session_id": session_id,
             "status": "processing",
@@ -342,7 +336,9 @@ async def process_rfp(
             "updated_at": datetime.now()
         }
         
-        await session_crud.create_session(session_data)
+        # Save session to MongoDB immediately
+        session_db_id = await session_crud.create_session(session_data)
+        logger.info(f"✅ Session created in MongoDB with ID: {session_db_id}")
 
         # ---------------------------
         # Start processing in background
@@ -352,11 +348,11 @@ async def process_rfp(
             rfp_path=rfp_path,
             image_paths=image_paths,
             coordinate_data=coordinate_data,
-            ocr_output_path=ocr_output_path,
-            classified_images_json_path=classified_images_json_path,
-            chunked_output_path=chunked_output_path,
-            classified_output_path=classified_output_path,
-            inception_pdf_path=inception_pdf_path,
+            ocr_output_path=session_output_dir / "ocr_output.txt",
+            classified_images_json_path=session_output_dir / "classified_images.json",
+            chunked_output_path=session_output_dir / "chunked_output.json",
+            classified_output_path=session_output_dir / "classified_output.json",
+            inception_pdf_path=session_output_dir / "inception.pdf",
             processed_images_dir=processed_images_dir
         ))
 
@@ -377,6 +373,28 @@ async def process_rfp(
         raise
     except Exception as e:
         log_with_session(f"❌ Error: {str(e)}", session_id, logging.ERROR)
+        # Even if there's an error, try to save the failed session to MongoDB
+        try:
+            error_session_data = {
+                "session_id": session_id,
+                "status": "failed",
+                "progress": {"completed": -1},
+                "coordinate_data": {
+                    "start": {"latitude": start_latitude, "longitude": start_longitude},
+                    "end": {"latitude": end_latitude, "longitude": end_longitude}
+                },
+                "original_files": {
+                    "rfp": [rfp_document.filename if 'rfp_document' in locals() else "unknown"],
+                    "images": [img.filename for img in images] if 'images' in locals() else []
+                },
+                "error": str(e),
+                "created_at": datetime.now(),
+                "updated_at": datetime.now()
+            }
+            await session_crud.create_session(error_session_data)
+        except:
+            pass  # If MongoDB save fails, at least we tried
+        
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
 
 # ---------------------------
@@ -658,62 +676,71 @@ async def download_intermediate_file(session_id: str, file_type: str):
 @app.get("/sessions")
 async def get_all_sessions():
     """Get all active session IDs and their progress"""
-    if not progress_store:
-        return {"sessions": [], "count": 0}
-    
-    sessions = []
-    for session_id, progress in progress_store.items():
-        sessions.append({
-            "session_id": session_id,
-            "progress": progress,
-            "is_complete": progress.get("completed", 0) >= 100.0
-        })
-    
-    return {
-        "sessions": sessions,
-        "count": len(sessions)
-    }
+    try:
+        # Get sessions from MongoDB
+        mongo_sessions = await session_crud.get_all_sessions(limit=100)
+        
+        # Convert ObjectId to string for JSON serialization
+        serialized_sessions = []
+        for session in mongo_sessions:
+            # Convert ObjectId to string
+            if '_id' in session:
+                session['_id'] = str(session['_id'])
+            serialized_sessions.append(session)
+        
+        # Also include in-memory sessions for backward compatibility
+        memory_sessions = []
+        for session_id, progress in progress_store.items():
+            memory_sessions.append({
+                "session_id": session_id,
+                "progress": progress,
+                "is_complete": progress.get("completed", 0) >= 100.0,
+                "source": "memory"
+            })
+        
+        return {
+            "mongo_sessions": serialized_sessions,
+            "memory_sessions": memory_sessions,
+            "mongo_count": len(serialized_sessions),
+            "memory_count": len(memory_sessions)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching sessions from MongoDB: {e}")
+        # Fallback to memory store only
+        if not progress_store:
+            return {"sessions": [], "count": 0}
+        
+        sessions = []
+        for session_id, progress in progress_store.items():
+            sessions.append({
+                "session_id": session_id,
+                "progress": progress,
+                "is_complete": progress.get("completed", 0) >= 100.0
+            })
+        
+        return {
+            "sessions": sessions,
+            "count": len(sessions),
+            "note": "Using memory store due to MongoDB error"
+        }
 
 # ---------------------------
 # Get specific session details
 # ---------------------------
 @app.get("/sessions/{session_id}")
-async def get_session_details(session_id: str):
-    """Get details for a specific session"""
-    if session_id not in progress_store:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    session_dir = OUTPUT_DIR / session_id
-    files_available = []
-    
-    if session_dir.exists():
-        file_checks = {
-            "ocr": session_dir / "ocr_output.txt",
-            "chunked": session_dir / "chunked_output.json",
-            "classified": session_dir / "classified_output.json",
-            "inception": session_dir / "inception.pdf",
-            "classified_images": session_dir / "classified_images.json",
-            "processed_images": session_dir / "processed_images"
-        }
-        
-        for file_type, path in file_checks.items():
-            if path.exists():
-                if path.is_dir():
-                    files_available.append({
-                        "type": file_type,
-                        "count": len(list(path.iterdir()))
-                    })
-                else:
-                    files_available.append({
-                        "type": file_type,
-                        "size": path.stat().st_size
-                    })
-    
-    return {
-        "session_id": session_id,
-        "progress": progress_store[session_id],
-        "files_available": files_available
-    }
+async def get_mongo_session(session_id: str):
+    """Get a specific session from MongoDB"""
+    try:
+        session = await session_crud.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found in MongoDB")
+        return session
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching session from MongoDB: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching session: {str(e)}")
 
 # ---------------------------
 # Log streaming endpoint (SSE)

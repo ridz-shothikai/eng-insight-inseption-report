@@ -9,8 +9,20 @@ logger = logging.getLogger(__name__)
 
 class SessionCRUD:
     def __init__(self):
-        self.db = get_database()
-        self.sessions = self.db.sessions
+        self._db = None
+        self._sessions = None
+    
+    @property
+    def db(self):
+        if self._db is None:
+            self._db = get_database()
+        return self._db
+    
+    @property
+    def sessions(self):
+        if self._sessions is None:
+            self._sessions = self.db.sessions
+        return self._sessions
     
     async def create_session(self, session_data: dict) -> str:
         """Create a new session"""
@@ -50,8 +62,20 @@ class SessionCRUD:
 
 class MarkdownCRUD:
     def __init__(self):
-        self.db = get_database()
-        self.markdown_sections = self.db.markdown_sections
+        self._db = None
+        self._markdown_sections = None
+    
+    @property
+    def db(self):
+        if self._db is None:
+            self._db = get_database()
+        return self._db
+    
+    @property
+    def markdown_sections(self):
+        if self._markdown_sections is None:
+            self._markdown_sections = self.db.markdown_sections
+        return self._markdown_sections
     
     async def save_markdown_section(self, session_id: str, section_id: str, content: str):
         """Save or update a markdown section"""
@@ -81,8 +105,20 @@ class MarkdownCRUD:
 
 class FileCRUD:
     def __init__(self):
-        self.db = get_database()
-        self.processed_files = self.db.processed_files
+        self._db = None
+        self._processed_files = None
+    
+    @property
+    def db(self):
+        if self._db is None:
+            self._db = get_database()
+        return self._db
+    
+    @property
+    def processed_files(self):
+        if self._processed_files is None:
+            self._processed_files = self.db.processed_files
+        return self._processed_files
     
     async def save_file_metadata(self, session_id: str, file_type: str, file_path: str, file_size: int):
         """Save processed file metadata"""
@@ -103,7 +139,7 @@ class FileCRUD:
         """Delete all file metadata for a session"""
         await self.processed_files.delete_many({"session_id": session_id})
 
-# Global instances
+# Global instances - these will initialize connections when first used
 session_crud = SessionCRUD()
 markdown_crud = MarkdownCRUD()
 file_crud = FileCRUD()

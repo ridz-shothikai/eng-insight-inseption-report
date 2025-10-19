@@ -1,40 +1,56 @@
 import os
+from pathlib import Path
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure
 import logging
+from dotenv import load_dotenv
+
+# Load .env from project root - more robust path resolution
+project_root = Path(__file__).parent.parent.parent  # Go up one more level
+dotenv_path = project_root / ".env"
+
+# Try multiple possible locations for .env file
+if dotenv_path.exists():
+    load_dotenv(dotenv_path=dotenv_path)
+else:
+    # Try current directory as fallback
+    load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 class MongoDB:
-    client: AsyncIOMotorClient = None
-    sync_client: MongoClient = None
-    
+    def __init__(self):
+        self.client = None
+        self.sync_client = None
+        self.db_name = os.getenv("MONGODB_DB", "rfp_processor")
+
     async def connect(self):
-        """Connect to MongoDB"""
+        mongo_url = os.getenv("MONGODB_URL")
+        if not mongo_url:
+            # Debug information
+            logger.error(f"❌ MONGODB_URL not found. Current working directory: {os.getcwd()}")
+            logger.error(f"❌ Project root: {project_root}")
+            logger.error(f"❌ .env path attempted: {dotenv_path}")
+            logger.error(f"❌ .env exists: {dotenv_path.exists()}")
+            raise ValueError("❌ MONGODB_URL is not set in environment or .env file")
+
+        logger.info(f"Connecting to MongoDB DB '{self.db_name}' at {mongo_url}")
         try:
-            # For async operations
             self.client = AsyncIOMotorClient(
-                os.getenv("MONGODB_URL", ""),
+                mongo_url,
                 maxPoolSize=10,
                 minPoolSize=5
             )
-            
-            # For sync operations (if needed)
-            self.sync_client = MongoClient(
-                os.getenv("MONGODB_URL", "")
-            )
-            
+            self.sync_client = MongoClient(mongo_url)
+
             # Test connection
             await self.client.admin.command('ping')
             logger.info("✅ Connected to MongoDB")
-            
-        except ConnectionFailure as e:
+        except Exception as e:
             logger.error(f"❌ MongoDB connection failed: {e}")
             raise
 
     async def close(self):
-        """Close MongoDB connection"""
         if self.client:
             self.client.close()
         if self.sync_client:
@@ -45,9 +61,11 @@ class MongoDB:
 mongodb = MongoDB()
 
 def get_database():
-    """Get database instance"""
-    return mongodb.client.get_database(os.getenv("MONGODB_DB", "rfp_processor"))
+    if mongodb.client is None:
+        raise RuntimeError("MongoDB not connected. Call connect() first.")
+    return mongodb.client[mongodb.db_name]
 
 def get_sync_database():
-    """Get sync database instance"""
-    return mongodb.sync_client.get_database(os.getenv("MONGODB_DB", "rfp_processor"))
+    if mongodb.sync_client is None:
+        raise RuntimeError("MongoDB sync client not connected.")
+    return mongodb.sync_client[mongodb.db_name]
