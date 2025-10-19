@@ -4,7 +4,8 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
-from typing import List, Dict
+from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, Field
 import os
 import shutil
 import zipfile
@@ -119,6 +120,16 @@ markdown_store: Dict[str, Dict[str, str]] = {}
 # ---------------------------
 # Custom Functions
 # ---------------------------
+
+class SessionUpdateRequest(BaseModel):
+    status: Optional[str] = None
+    progress: Optional[Dict[str, Any]] = None
+    coordinate_data: Optional[Dict[str, Any]] = None
+    original_files: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+    class Config:
+        extra = "forbid"  # Reject any fields not explicitly defined
 
 def create_markdown_stream_handler(session_id: str):
     """Create a callback function to handle markdown streaming AND accumulation for a session"""
@@ -741,6 +752,294 @@ async def get_mongo_session(session_id: str):
     except Exception as e:
         logger.error(f"Error fetching session from MongoDB: {e}")
         raise HTTPException(status_code=500, detail=f"Error fetching session: {str(e)}")
+    
+# ---------------------------
+# Session CRUD operations
+# ---------------------------
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    """Delete a session and all its associated data"""
+    try:
+        # Check if session exists
+        session = await session_crud.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Delete session from MongoDB
+        await session_crud.delete_session(session_id)
+        
+        # Delete associated markdown sections
+        await markdown_crud.delete_session_markdown(session_id)
+        
+        # Delete associated file metadata
+        await file_crud.delete_session_files(session_id)
+        
+        # Clean up local files
+        session_dirs = [
+            RFP_UPLOAD_DIR / session_id,
+            IMAGE_UPLOAD_DIR / session_id,
+            OUTPUT_DIR / session_id
+        ]
+        for dir_path in session_dirs:
+            if dir_path.exists():
+                shutil.rmtree(dir_path)
+        
+        # Clean up in-memory stores
+        progress_store.pop(session_id, None)
+        markdown_store.pop(session_id, None)
+        log_streamer.clear_history(session_id)
+        
+        logger.info(f"🗑️ Session deleted: {session_id}")
+        return {"message": f"Session {session_id} deleted successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting session {session_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error deleting session: {str(e)}")
+
+@app.put("/sessions/{session_id}")
+async def update_session(
+    session_id: str,
+    updates: SessionUpdateRequest
+):
+    """Update session metadata"""
+    try:
+        session = await session_crud.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Convert to dict, keeping only provided fields
+        update_dict = updates.dict(exclude_unset=True)
+        
+        allowed_updates = {
+            "status", "progress", "coordinate_data", 
+            "original_files", "error"
+        }
+        
+        filtered_updates = {
+            k: v for k, v in update_dict.items() 
+            if k in allowed_updates and v is not None
+        }
+        
+        if not filtered_updates:
+            raise HTTPException(status_code=400, detail="No valid fields to update")
+        
+        filtered_updates["updated_at"] = datetime.now()
+        
+        # Update MongoDB
+        await session_crud.sessions.update_one(
+            {"session_id": session_id},
+            {"$set": filtered_updates}
+        )
+        
+        # Update in-memory progress if needed
+        if "progress" in filtered_updates and session_id in progress_store:
+            progress_store[session_id].update(filtered_updates["progress"])
+        
+        logger.info(f"📝 Session updated: {session_id}")
+        return {"message": f"Session {session_id} updated successfully", "updates": filtered_updates}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating session {session_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error updating session: {str(e)}")
+
+@app.post("/sessions/{session_id}/clone")
+async def clone_session(session_id: str, new_session_id: str = None):
+    """Clone an existing session with a new session ID"""
+    try:
+        # Get original session
+        original_session = await session_crud.get_session(session_id)
+        if not original_session:
+            raise HTTPException(status_code=404, detail="Original session not found")
+        
+        # Generate new session ID if not provided
+        if not new_session_id:
+            new_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Check if new session ID already exists
+        existing_session = await session_crud.get_session(new_session_id)
+        if existing_session:
+            raise HTTPException(status_code=400, detail="New session ID already exists")
+        
+        # Create cloned session data
+        cloned_session = original_session.copy()
+        cloned_session["session_id"] = new_session_id
+        cloned_session["status"] = "cloned"
+        cloned_session["progress"] = {"completed": 0.0}  # Reset progress
+        cloned_session["created_at"] = datetime.now()
+        cloned_session["updated_at"] = datetime.now()
+        
+        # Remove MongoDB _id to create new document
+        if "_id" in cloned_session:
+            del cloned_session["_id"]
+        
+        # Save cloned session to MongoDB
+        await session_crud.create_session(cloned_session)
+        
+        # Clone markdown sections if they exist
+        try:
+            original_markdown = await markdown_crud.get_session_markdown(session_id)
+            for section_id, content in original_markdown.items():
+                await markdown_crud.save_markdown_section(new_session_id, section_id, content)
+        except Exception as e:
+            logger.warning(f"Could not clone markdown sections: {e}")
+        
+        # Clone file metadata
+        try:
+            original_files = await file_crud.get_session_files(session_id)
+            for file_meta in original_files:
+                # Create new file metadata with new session ID
+                new_file_meta = file_meta.copy()
+                new_file_meta["session_id"] = new_session_id
+                new_file_meta["created_at"] = datetime.now()
+                if "_id" in new_file_meta:
+                    del new_file_meta["_id"]
+                
+                await file_crud.processed_files.insert_one(new_file_meta)
+        except Exception as e:
+            logger.warning(f"Could not clone file metadata: {e}")
+        
+        # Initialize in-memory stores for new session
+        progress_store[new_session_id] = {"completed": 0.0}
+        markdown_store[new_session_id] = {}
+        
+        logger.info(f"🌀 Session cloned: {session_id} -> {new_session_id}")
+        return {
+            "message": f"Session cloned successfully",
+            "original_session_id": session_id,
+            "new_session_id": new_session_id
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error cloning session {session_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error cloning session: {str(e)}")
+
+@app.post("/sessions/merge")
+async def merge_sessions(session_ids: List[str], new_session_id: str = None):
+    """Merge multiple sessions into a new session"""
+    try:
+        if len(session_ids) < 2:
+            raise HTTPException(status_code=400, detail="At least 2 sessions required for merging")
+        
+        # Generate new session ID if not provided
+        if not new_session_id:
+            new_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Check if new session ID already exists
+        existing_session = await session_crud.get_session(new_session_id)
+        if existing_session:
+            raise HTTPException(status_code=400, detail="New session ID already exists")
+        
+        # Get all source sessions
+        source_sessions = []
+        for session_id in session_ids:
+            session = await session_crud.get_session(session_id)
+            if not session:
+                raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+            source_sessions.append(session)
+        
+        # Create merged session data
+        merged_session = {
+            "session_id": new_session_id,
+            "status": "merged",
+            "progress": {"completed": 100.0},  # Mark as completed since we're merging existing data
+            "coordinate_data": source_sessions[0].get("coordinate_data", {}),  # Use first session's coordinates
+            "original_files": {
+                "rfp": [],
+                "images": []
+            },
+            "source_sessions": session_ids,  # Track which sessions were merged
+            "created_at": datetime.now(),
+            "updated_at": datetime.now()
+        }
+        
+        # Aggregate files from all source sessions
+        for session in source_sessions:
+            original_files = session.get("original_files", {})
+            merged_session["original_files"]["rfp"].extend(original_files.get("rfp", []))
+            merged_session["original_files"]["images"].extend(original_files.get("images", []))
+        
+        # Save merged session to MongoDB
+        await session_crud.create_session(merged_session)
+        
+        # Merge markdown sections from all source sessions
+        all_markdown = {}
+        for session_id in session_ids:
+            try:
+                session_markdown = await markdown_crud.get_session_markdown(session_id)
+                for section_id, content in session_markdown.items():
+                    # Append content if section already exists, otherwise create new
+                    if section_id in all_markdown:
+                        all_markdown[section_id] += f"\n\n--- Merged from {session_id} ---\n\n{content}"
+                    else:
+                        all_markdown[section_id] = content
+            except Exception as e:
+                logger.warning(f"Could not merge markdown from {session_id}: {e}")
+        
+        # Save merged markdown
+        for section_id, content in all_markdown.items():
+            await markdown_crud.save_markdown_section(new_session_id, section_id, content)
+        
+        # Initialize in-memory stores
+        progress_store[new_session_id] = {"completed": 100.0}
+        markdown_store[new_session_id] = all_markdown
+        
+        logger.info(f"🔗 Sessions merged into: {new_session_id}")
+        return {
+            "message": f"Sessions merged successfully",
+            "merged_session_id": new_session_id,
+            "source_sessions": session_ids
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error merging sessions: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error merging sessions: {str(e)}")
+
+@app.patch("/sessions/{session_id}/metadata")
+async def update_session_metadata(
+    session_id: str,
+    coordinate_data: dict = None,
+    original_files: dict = None
+):
+    """Update specific session metadata (coordinates or files)"""
+    try:
+        session = await session_crud.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        update_data = {"updated_at": datetime.now()}
+        
+        if coordinate_data:
+            update_data["coordinate_data"] = coordinate_data
+        
+        if original_files:
+            update_data["original_files"] = original_files
+        
+        if len(update_data) == 1:  # Only updated_at was set
+            raise HTTPException(status_code=400, detail="No valid metadata provided for update")
+        
+        # Update session in MongoDB
+        await session_crud.sessions.update_one(
+            {"session_id": session_id},
+            {"$set": update_data}
+        )
+        
+        logger.info(f"📋 Session metadata updated: {session_id}")
+        return {"message": f"Session {session_id} metadata updated successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating session metadata {session_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error updating session metadata: {str(e)}")
 
 # ---------------------------
 # Log streaming endpoint (SSE)
