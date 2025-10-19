@@ -45,3 +45,7 @@ sse-starlette
 #testing
 pytest
 
+#mongodb
+pymongo
+motor
+

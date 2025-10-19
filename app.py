@@ -25,6 +25,13 @@ from src.utils.file_handler import cleanup_old_files, ensure_directories
 from src.utils.validators import validate_coordinates
 from src.utils.log_streamer import log_streamer, SessionLogHandler
 
+#Import Mongodb packages
+
+from src.database.mongodb import mongodb, get_database
+from src.database.crud import session_crud, markdown_crud, file_crud
+from bson import ObjectId
+import json
+
 # ---------------------------
 # Logging setup
 # ---------------------------
@@ -109,17 +116,27 @@ markdown_store: Dict[str, Dict[str, str]] = {}
 #     ...
 # }
 
-
+# ---------------------------
+# Custom Functions
+# ---------------------------
 
 def create_markdown_stream_handler(session_id: str):
     """Create a callback function to handle markdown streaming AND accumulation for a session"""
-    def stream_handler(section_id: str, chunk: str):
-        # Accumulate markdown in store
+    async def stream_handler(section_id: str, chunk: str):
+        # Accumulate markdown in memory store (for real-time access)
         if session_id not in markdown_store:
             markdown_store[session_id] = {}
         if section_id not in markdown_store[session_id]:
             markdown_store[session_id][section_id] = ""
         markdown_store[session_id][section_id] += chunk
+        
+        # Save to MongoDB (for persistence)
+        try:
+            await markdown_crud.save_markdown_section(
+                session_id, section_id, markdown_store[session_id][section_id]
+            )
+        except Exception as e:
+            logger.error(f"Error saving markdown to MongoDB: {e}")
         
         # Also stream it via log_streamer for real-time display
         log_streamer.broadcast(
@@ -128,6 +145,25 @@ def create_markdown_stream_handler(session_id: str):
         )
     return stream_handler
 
+async def create_indexes():
+    """Create MongoDB indexes"""
+    db = get_database()
+    
+    # Session indexes
+    await db.sessions.create_index("session_id", unique=True)
+    await db.sessions.create_index("created_at")
+    await db.sessions.create_index("status")
+    
+    # Markdown indexes
+    await db.markdown_sections.create_index([("session_id", 1), ("section_id", 1)], unique=True)
+    await db.markdown_sections.create_index("session_id")
+    
+    # File indexes
+    await db.processed_files.create_index([("session_id", 1), ("file_type", 1)])
+    await db.processed_files.create_index("session_id")
+    
+    logger.info("✅ MongoDB indexes created")
+
 
 # ---------------------------
 # Startup & Shutdown events
@@ -135,6 +171,13 @@ def create_markdown_stream_handler(session_id: str):
 @app.on_event("startup")
 async def startup_event():
     logger.info("Starting RFP Processing API...")
+
+    # Connect to MongoDB
+    await mongodb.connect()
+
+    # Create indexes
+    await create_indexes()
+
     cleanup_old_files(OUTPUT_DIR, days=7)
     cleanup_old_files(UPLOAD_DIR, days=7)
     
@@ -177,6 +220,7 @@ async def cleanup_old_history():
 @app.on_event("shutdown")
 async def shutdown_event():
     logger.info("Shutting down RFP Processing API...")
+    await mongodb.close()
 
 # ---------------------------
 # Root & Health
@@ -279,6 +323,27 @@ async def process_rfp(
             "end": {"latitude": end_latitude, "longitude": end_longitude}
         }
 
+        session_data = {
+            "session_id": session_id,
+            "status": "processing",
+            "progress": {
+                "ocr": 0.0, "images": 0.0, "chunking": 0.0, 
+                "classification": 0.0, "report": 0.0, "completed": 0.0
+            },
+            "coordinate_data": {
+                "start": {"latitude": start_latitude, "longitude": start_longitude},
+                "end": {"latitude": end_latitude, "longitude": end_longitude}
+            },
+            "original_files": {
+                "rfp": [rfp_document.filename],
+                "images": [img.filename for img in images]
+            },
+            "created_at": datetime.now(),
+            "updated_at": datetime.now()
+        }
+        
+        await session_crud.create_session(session_data)
+
         # ---------------------------
         # Start processing in background
         # ---------------------------
@@ -335,6 +400,12 @@ async def process_rfp_background(
         asyncio.create_task(log_progress(session_id))
         
         log_with_session("⚡ Running OCR and image processing in parallel", session_id)
+
+        # Update progress in MongoDB
+        await session_crud.update_session_progress(session_id, {
+            "ocr": 0.0, "images": 0.0, "chunking": 0.0, 
+            "classification": 0.0, "report": 0.0, "completed": 0.0
+        })
         
         # Parallel tasks: OCR + Images
         await asyncio.gather(
@@ -349,7 +420,10 @@ async def process_rfp_background(
                 progress_store
             )
         )
+
+        # Update progress
         progress_store[session_id]["images"] = 100.0
+        await session_crud.update_session_progress(session_id, progress_store[session_id])
 
         if not ocr_output_path.exists():
             raise Exception("OCR processing failed")
@@ -357,6 +431,20 @@ async def process_rfp_background(
             raise Exception("Image classification failed")
         if not processed_images_dir.exists() or not any(processed_images_dir.iterdir()):
             raise Exception("Image processing failed - no images generated")
+
+        # Save file metadata to MongoDB
+        try:
+            if ocr_output_path.exists():
+                await file_crud.save_file_metadata(
+                    session_id, "ocr", str(ocr_output_path), ocr_output_path.stat().st_size
+                )
+            if classified_images_json_path.exists():
+                await file_crud.save_file_metadata(
+                    session_id, "classified_images", str(classified_images_json_path), 
+                    classified_images_json_path.stat().st_size
+                )
+        except Exception as e:
+            logger.error(f"Error saving file metadata to MongoDB: {e}")
 
         log_with_session("✓ Parallel processing completed", session_id)
 
@@ -373,12 +461,26 @@ async def process_rfp_background(
             progress_store=progress_store
         )
         progress_store[session_id]["chunking"] = 100.0
+        
+        # Save chunked file metadata
+        if chunked_output_path.exists():
+            await file_crud.save_file_metadata(
+                session_id, "chunked", str(chunked_output_path), chunked_output_path.stat().st_size
+            )
+        
         log_with_session("✓ Text chunking completed", session_id)
 
         log_with_session("🏷️ Starting chunk classification", session_id)
         progress_store[session_id]["classification"] = 0.0
         await asyncio.to_thread(classify_chunks, str(chunked_output_path), str(classified_output_path), 5, session_id, progress_store)
         progress_store[session_id]["classification"] = 100.0
+        
+        # Save classified file metadata
+        if classified_output_path.exists():
+            await file_crud.save_file_metadata(
+                session_id, "classified", str(classified_output_path), classified_output_path.stat().st_size
+            )
+        
         log_with_session("✓ Chunk classification completed", session_id)
 
         log_with_session("📊 Generating inception report", session_id)
@@ -398,10 +500,23 @@ async def process_rfp_background(
         )
         progress_store[session_id]["report"] = 100.0
         progress_store[session_id]["completed"] = 100.0
+        
+        # Save final report metadata
+        if inception_pdf_path.exists():
+            await file_crud.save_file_metadata(
+                session_id, "inception", str(inception_pdf_path), inception_pdf_path.stat().st_size
+            )
+        
+        # Update final status in MongoDB
+        await session_crud.update_session_status(session_id, "completed")
+        await session_crud.update_session_progress(session_id, progress_store[session_id])
+        
         log_with_session("✅ Processing complete! Report generated", session_id)
 
     except Exception as e:
         log_with_session(f"❌ Background processing error: {str(e)}", session_id, logging.ERROR)
+        # Update MongoDB with error status
+        await session_crud.update_session_status(session_id, "failed", str(e))
         # Optionally update progress to indicate failure
         progress_store[session_id]["error"] = str(e)
         progress_store[session_id]["completed"] = -1  # Indicate failure
@@ -678,10 +793,25 @@ async def fetch_markdown(session_id: str):
 async def get_markdown(session_id: str):
     """Fetch complete accumulated markdown for a session"""
     
-    if session_id not in markdown_store:
-        raise HTTPException(status_code=404, detail="Session not found or no markdown generated yet")
+    # Try to get from MongoDB first, then fallback to memory store
+    markdown_data = {}
     
-    markdown_data = markdown_store[session_id]
+    try:
+        # Try MongoDB first
+        db_markdown = await markdown_crud.get_session_markdown(session_id)
+        if db_markdown:
+            markdown_data = db_markdown
+        elif session_id in markdown_store:
+            markdown_data = markdown_store[session_id]
+        else:
+            raise HTTPException(status_code=404, detail="Session not found or no markdown generated yet")
+    except Exception as e:
+        logger.error(f"Error fetching markdown from MongoDB: {e}")
+        # Fallback to memory store
+        if session_id in markdown_store:
+            markdown_data = markdown_store[session_id]
+        else:
+            raise HTTPException(status_code=404, detail="Session not found or no markdown generated yet")
     
     if not markdown_data:
         raise HTTPException(status_code=404, detail="No markdown data available yet")
@@ -703,12 +833,20 @@ async def get_markdown(session_id: str):
             full_markdown += markdown_data[section_id] + "\n\n"
             completed_sections += 1
     
-    # Get progress from progress_store if available
+    # Get progress from MongoDB if available
     report_progress = 0
     is_complete = False
-    if session_id in progress_store:
-        report_progress = progress_store[session_id].get("report", 0)
-        is_complete = progress_store[session_id].get("completed", 0) >= 100
+    try:
+        session_data = await session_crud.get_session(session_id)
+        if session_data:
+            report_progress = session_data.get("progress", {}).get("report", 0)
+            is_complete = session_data.get("status") == "completed"
+    except Exception as e:
+        logger.error(f"Error fetching session progress from MongoDB: {e}")
+        # Fallback to memory store
+        if session_id in progress_store:
+            report_progress = progress_store[session_id].get("report", 0)
+            is_complete = progress_store[session_id].get("completed", 0) >= 100
     
     return {
         "session_id": session_id,
@@ -722,7 +860,6 @@ async def get_markdown(session_id: str):
             "is_complete": is_complete
         }
     }
-
 # ---------------------------
 # Cleanup session files
 # ---------------------------
