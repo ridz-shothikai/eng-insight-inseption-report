@@ -27,7 +27,27 @@ from reportlab.platypus import Frame
 from reportlab.platypus import PageTemplate
 from reportlab.pdfgen import canvas
 
+# Import log streamer
+from src.utils.log_streamer import log_streamer, SessionLogHandler
+
+# Setup logger with session handler
 logger = logging.getLogger(__name__)
+
+# Add session log handler if not already added
+if not any(isinstance(h, SessionLogHandler) for h in logger.handlers):
+    session_log_handler = SessionLogHandler(log_streamer)
+    session_log_handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    ))
+    logger.addHandler(session_log_handler)
+
+# Helper function for session-aware logging
+def log_with_session(message: str, session_id: str = None, level=logging.INFO):
+    """Helper to log with session context for streaming"""
+    if session_id:
+        logger.log(level, message, extra={'session_id': session_id})
+    else:
+        logger.log(level, message)
 
 
 # -----------------------------
@@ -52,13 +72,14 @@ class ReportSection:
 # GOOGLE SEARCH TOOL
 # -----------------------------
 class GoogleSearchTool:
-    def __init__(self):
+    def __init__(self, session_id: str = None):
         self.api_key = os.getenv("GOOGLE_API_KEY")
         self.cse_id = os.getenv("GOOGLE_CSE_ID")
+        self.session_id = session_id
 
     def search(self, query: str, max_retries: int = 3) -> Dict:
         if not self.api_key or not self.cse_id:
-            logger.warning("Google Search API credentials not found, skipping search")
+            log_with_session("Google Search API credentials not found, skipping search", self.session_id, logging.WARNING)
             return {"results": []}
 
         params = {"key": self.api_key, "cx": self.cse_id, "q": query, "num": 3}
@@ -69,7 +90,7 @@ class GoogleSearchTool:
                 response = requests.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=10)
 
                 if response.status_code == 429:
-                    logger.warning(f"Rate limited. Retrying in 30s... (attempt {attempt+1})")
+                    log_with_session(f"Rate limited. Retrying in 30s... (attempt {attempt+1})", self.session_id, logging.WARNING)
                     time.sleep(30)
                     continue
 
@@ -77,7 +98,7 @@ class GoogleSearchTool:
                 data = response.json()
 
                 if "error" in data:
-                    logger.error(f"Search API error: {data.get('error')}")
+                    log_with_session(f"Search API error: {data.get('error')}", self.session_id, logging.ERROR)
                     return {"results": []}
 
                 results = [
@@ -87,7 +108,7 @@ class GoogleSearchTool:
                 return {"results": results}
 
             except Exception as e:
-                logger.error(f"Search error: {e}")
+                log_with_session(f"Search error: {e}", self.session_id, logging.ERROR)
                 if attempt < max_retries:
                     time.sleep(30)
 
@@ -146,16 +167,25 @@ class ContentGenerator:
         ]
     }
 
-    def __init__(self, location: str, progress_callback: Optional[Callable[[float], None]] = None):
+    def __init__(self, location: str, progress_callback: Optional[Callable[[float], None]] = None, session_id: str = None, stream_callback: Optional[Callable[[str, str], None]] = None):
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
             raise ValueError("GOOGLE_API_KEY not found in environment variables")
         
         genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel("gemini-2.5-flash")
+        
+            # Primary and fallback models
+        self.primary_model_name = "gemini-2.5-flash-lite"
+        self.fallback_model_name = "gemini-2.5-flash-lite"  # Weaker/cheaper model
+        
+        self.model = genai.GenerativeModel(self.primary_model_name)
+        self.fallback_model = genai.GenerativeModel(self.fallback_model_name)
+
         self.location = location
-        self.search_tool = GoogleSearchTool()
+        self.session_id = session_id
+        self.search_tool = GoogleSearchTool(session_id=session_id)
         self.progress_callback = progress_callback
+        self.stream_callback = stream_callback
 
         # self.safety_settings = [
         #     {
@@ -176,7 +206,8 @@ class ContentGenerator:
         #     },
         # ]
         
-        logger.info(f"ContentGenerator initialized for location: {location}")
+        log_with_session(f"ContentGenerator initialized for location: {location}", session_id)
+        log_with_session(f"Primary model: {self.primary_model_name}, Fallback: {self.fallback_model_name}", session_id)
 
     def update_progress(self, value: float):
         if self.progress_callback:
@@ -227,7 +258,70 @@ Generate comprehensive, technical content suitable for a professional engineerin
         
         return prompt
 
+    def _generate_with_streaming(self, prompt: str, section_id: str, max_retries: int = 3) -> str:
+        # Try primary model first
+        for attempt in range(max_retries + 1):
+            try:
+                time.sleep(1.0)
+                full_response = ""
+                
+                response = self.model.generate_content(prompt, stream=True)
+                
+                for chunk in response:
+                    if chunk.text:
+                        full_response += chunk.text
+                        if self.stream_callback:
+                            self.stream_callback(section_id, chunk.text)
+                
+                return full_response.strip()
+                
+            except Exception as e:
+                if "429" in str(e) or "rateLimit" in str(e):
+                    if attempt < max_retries:
+                        log_with_session(f"⏱️ Rate limited on {self.primary_model_name}. Retrying in 30s... (attempt {attempt+1})", self.session_id, logging.WARNING)
+                        time.sleep(30)
+                    else:
+                        log_with_session(f"⚠️ Max retries exceeded on {self.primary_model_name}, falling back to {self.fallback_model_name}", self.session_id, logging.WARNING)
+                        break  # Exit to try fallback model
+                else:
+                    log_with_session(f"❌ Content generation error on {self.primary_model_name}: {e}", self.session_id, logging.ERROR)
+                    break  # Exit to try fallback model
+        
+        # Fallback to weaker model
+        log_with_session(f"🔄 Attempting with fallback model: {self.fallback_model_name}", self.session_id, logging.INFO)
+        
+        for attempt in range(max_retries + 1):
+            try:
+                time.sleep(1.0)
+                full_response = ""
+                
+                response = self.fallback_model.generate_content(prompt, stream=True)
+                
+                for chunk in response:
+                    if chunk.text:
+                        full_response += chunk.text
+                        if self.stream_callback:
+                            self.stream_callback(section_id, chunk.text)
+                
+                log_with_session(f"✅ Successfully generated with fallback model: {self.fallback_model_name}", self.session_id)
+                return full_response.strip()
+                
+            except Exception as e:
+                if "429" in str(e) or "rateLimit" in str(e):
+                    if attempt < max_retries:
+                        log_with_session(f"⏱️ Rate limited on {self.fallback_model_name}. Retrying in 30s... (attempt {attempt+1})", self.session_id, logging.WARNING)
+                        time.sleep(30)
+                    else:
+                        log_with_session(f"❌ Max retries exceeded on fallback model {self.fallback_model_name}", self.session_id, logging.ERROR)
+                        raise Exception(f"Failed to generate content with both primary and fallback models")
+                else:
+                    log_with_session(f"❌ Content generation error on {self.fallback_model_name}: {e}", self.session_id, logging.ERROR)
+                    raise e
+
+    
     def _generate_with_retry(self, prompt: str, max_retries: int = 3) -> str:
+        """Non-streaming fallback"""
+        # Try primary model
         for attempt in range(max_retries + 1):
             try:
                 time.sleep(1.0)
@@ -236,35 +330,64 @@ Generate comprehensive, technical content suitable for a professional engineerin
             except Exception as e:
                 if "429" in str(e) or "rateLimit" in str(e):
                     if attempt < max_retries:
-                        logger.warning(f"Rate limited. Retrying in 30s... (attempt {attempt+1})")
+                        log_with_session(f"⏱️ Rate limited on {self.primary_model_name}. Retrying in 30s... (attempt {attempt+1})", self.session_id, logging.WARNING)
                         time.sleep(30)
                     else:
-                        logger.error("Max retries exceeded for rate limit")
-                        raise e
+                        log_with_session(f"⚠️ Max retries exceeded on {self.primary_model_name}, falling back to {self.fallback_model_name}", self.session_id, logging.WARNING)
+                        break
                 else:
-                    logger.error(f"Content generation error: {e}")
+                    log_with_session(f"❌ Content generation error on {self.primary_model_name}: {e}", self.session_id, logging.ERROR)
+                    break
+        
+        # Fallback to weaker model
+        log_with_session(f"🔄 Attempting with fallback model: {self.fallback_model_name}", self.session_id, logging.INFO)
+        
+        for attempt in range(max_retries + 1):
+            try:
+                time.sleep(1.0)
+                response = self.fallback_model.generate_content(prompt)
+                log_with_session(f"✅ Successfully generated with fallback model: {self.fallback_model_name}", self.session_id)
+                return response.text.strip()
+            except Exception as e:
+                if "429" in str(e) or "rateLimit" in str(e):
+                    if attempt < max_retries:
+                        log_with_session(f"⏱️ Rate limited on {self.fallback_model_name}. Retrying in 30s... (attempt {attempt+1})", self.session_id, logging.WARNING)
+                        time.sleep(30)
+                    else:
+                        log_with_session(f"❌ Max retries exceeded on fallback model {self.fallback_model_name}", self.session_id, logging.ERROR)
+                        raise Exception(f"Failed to generate content with both primary and fallback models")
+                else:
+                    log_with_session(f"❌ Content generation error on {self.fallback_model_name}: {e}", self.session_id, logging.ERROR)
                     raise e
 
     def generate_section(self, category: str, chunks: List[TextChunk]) -> ReportSection:
         if not chunks:
             chunks = [TextChunk(text="No input provided.")]
         
-        logger.info(f"Generating section: {category}")
+        log_with_session(f"📝 Generating section: {category}", self.session_id)
+        
+        # Notify streaming start
+        if self.stream_callback:
+            self.stream_callback(category, f"## {self.SECTION_TITLES.get(category, category)}\n\n")
         
         external_context = self._gather_context(category)
         base_prompt = self._get_section_prompt(category, chunks)
         full_prompt = base_prompt + external_context
         
-        content = self._generate_with_retry(full_prompt)
+        # Use streaming generation if callback is provided, otherwise fallback
+        if self.stream_callback:
+            content = self._generate_with_streaming(full_prompt, category)
+        else:
+            content = self._generate_with_retry(full_prompt)
 
         word_count = len(content.split())
-        logger.info(f"Generated '{category}' section: {word_count} words")
+        log_with_session(f"✓ Generated '{category}' section: {word_count} words", self.session_id)
         
         return ReportSection(
             section_id=category,
             title=self.SECTION_TITLES.get(category, category.replace('_', ' ').title()),
             content=content,
-            word_count=len(content.split()),
+            word_count=word_count,
             generated_at=datetime.now()
         )
 
@@ -278,12 +401,20 @@ Generate comprehensive, technical content suitable for a professional engineerin
         }
         
         prompt = appendix_prompts.get(appendix_type, f"Create {appendix_type} for {self.location}")
-        logger.info(f"Generating appendix: {appendix_type}")
+        log_with_session(f"📑 Generating appendix: {appendix_type}", self.session_id)
         
-        content = self._generate_with_retry(prompt)
+        # Notify streaming start for appendices too
+        if self.stream_callback:
+            self.stream_callback(appendix_type, f"## {self.SECTION_TITLES.get(appendix_type, appendix_type.replace('_', ' ').title())}\n\n")
+        
+        # Use streaming generation if callback is provided
+        if self.stream_callback:
+            content = self._generate_with_streaming(prompt, appendix_type)
+        else:
+            content = self._generate_with_retry(prompt)
 
         word_count = len(content.split())
-        logger.info(f"Generated '{appendix_type}' appendix: {word_count} words")
+        log_with_session(f"✓ Generated '{appendix_type}' appendix: {word_count} words", self.session_id)
         
         return ReportSection(
             section_id=appendix_type,
@@ -497,7 +628,8 @@ def create_pdf_report(
     location: str, 
     output_path: str, 
     image_data: List[Dict] = None, 
-    image_base_dir: str = None
+    image_base_dir: str = None,
+    session_id: str = None
 ):
     """Create PDF report with embedded images from classified_images.json"""
     output_path = Path(output_path)
@@ -566,7 +698,8 @@ def create_pdf_report(
     )
     body_style = ParagraphStyle(
         'Body', 
-        parent=styles['BodyText'], 
+        parent=styles['BodyText'],
+        fontName='Helvetica', 
         fontSize=11, 
         leading=16, 
         spaceAfter=8,
@@ -603,7 +736,7 @@ def create_pdf_report(
             if cat not in images_by_category:
                 images_by_category[cat] = []
             images_by_category[cat].append(item)
-        logger.info(f"Loaded {len(image_data)} images across {len(images_by_category)} categories")
+        log_with_session(f"📸 Loaded {len(image_data)} images across {len(images_by_category)} categories",session_id)
 
     # Cover page
     story.append(Paragraph("INCEPTION REPORT", title_style))
@@ -655,7 +788,7 @@ def create_pdf_report(
 
         # Insert images for this section's category
         if section.section_id in images_by_category:
-            logger.info(f"Adding {len(images_by_category[section.section_id])} images to section: {section.section_id}")
+            log_with_session(f"✓ Adding {len(images_by_category[section.section_id])} images to section: {section.section_id}", session_id)
             
             for img_info in images_by_category[section.section_id]:
                 img_path_str = img_info.get("img_path", "")
@@ -683,11 +816,11 @@ def create_pdf_report(
                         )
                         story.append(Paragraph(caption, centered_caption_style))
                         story.append(Spacer(1, 12))
-                        logger.info(f"✓ Added image: {full_img_path.name}")
+                        log_with_session(f"✓ Added image: {full_img_path.name}", session_id)
                     except Exception as e:
                         logger.warning(f"Failed to add image {full_img_path}: {e}")
                 else:
-                    logger.warning(f"Image not found: {full_img_path}")
+                    log_with_session(f"⚠️ Image not found: {full_img_path}", session_id, logging.WARNING)
 
         # Content paragraphs
         paragraphs = section.content.split('\n\n')
@@ -790,13 +923,13 @@ def create_pdf_report(
     try:
         # Build PDF - this will apply the template to all pages
         doc.build(story, onFirstPage=add_page_decorations, onLaterPages=add_page_decorations)
-        logger.info(f"✓ PDF report created: {output_path}")
+        log_with_session(f"✅ PDF report created: {output_path}", session_id)
     except Exception as e:
         logger.error(f"Failed to build PDF: {e}")
         raise
 
 
-def extract_location(input_file: str) -> str:
+def extract_location(input_file: str, session_id: str = None) -> str:
     try:
         with open(input_file, "r", encoding="utf-8") as f:
             sample_text = f.read()[:5000]
@@ -804,11 +937,14 @@ def extract_location(input_file: str) -> str:
         if not sample_text.strip():
             return "Unspecified location in India"
     except Exception as e:
-        logger.error(f"Failed to read OCR file: {e}")
+        log_with_session(f"❌ Failed to read OCR file: {e}", session_id, logging.ERROR)
         return "Unspecified location in India"
 
     genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-    model = genai.GenerativeModel("gemini-2.5-flash")
+    
+    # Initialize both models
+    primary_model = genai.GenerativeModel("gemini-2.5-flash-lite")
+    fallback_model = genai.GenerativeModel("gemini-2.5-flash-lite")
     
     prompt = f"""Extract ONLY the primary city/place from the text for a road/highway/bridge project in India.
 
@@ -818,28 +954,42 @@ Text:
 Respond with just the location name, nothing else.
 Location:"""
     
+    # Try primary model
     try:
-        location = model.generate_content(prompt).text.strip()
+        location = primary_model.generate_content(prompt).text.strip()
         if not location or len(location) < 3:
             return "Unspecified location in India"
         return location
     except Exception as e:
-        logger.error(f"Location extraction failed: {e}")
-        return "Unspecified location in India"
+        log_with_session(f"⚠️ Location extraction failed with primary model, trying fallback: {e}", session_id, logging.WARNING)
+        
+        # Try fallback model
+        try:
+            location = fallback_model.generate_content(prompt).text.strip()
+            if not location or len(location) < 3:
+                return "Unspecified location in India"
+            log_with_session(f"✅ Location extracted with fallback model", session_id)
+            return location
+        except Exception as fallback_e:
+            log_with_session(f"❌ Location extraction failed with both models: {fallback_e}", session_id, logging.ERROR)
+            return "Unspecified location in India"
 
 
-def enhance_location(location: str) -> str:
+def enhance_location(location: str, session_id: str = None) -> str:
     """Enhance location details using search"""
     if location == "Unspecified location in India":
         return location
 
-    logger.info(f"Enhancing location: {location}")
-    search_tool = GoogleSearchTool()
+    log_with_session(f"🔍 Enhancing location: {location}", session_id)
+    search_tool = GoogleSearchTool(session_id=session_id)
     results = search_tool.search(f"{location} district state India location details")
     context = "\n".join([r.get("snippet", "") for r in results.get("results", [])[:3]])
 
     genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-    model = genai.GenerativeModel("gemini-2.5-flash")
+    
+    # Initialize both models
+    primary_model = genai.GenerativeModel("gemini-2.5-flash-lite")
+    fallback_model = genai.GenerativeModel("gemini-2.5-flash-lite")
     
     prompt = f"""Enhance location into format 'City, District, State' for India.
 
@@ -851,14 +1001,25 @@ Search Results:
 Respond with just the enhanced location in format: City, District, State
 Enhanced Location:"""
     
+    # Try primary model
     try:
-        enhanced = model.generate_content(prompt).text.strip()
+        enhanced = primary_model.generate_content(prompt).text.strip()
         if enhanced and "," in enhanced:
             return enhanced
         return location
     except Exception as e:
-        logger.error(f"Location enhancement failed: {e}")
-        return location
+        log_with_session(f"⚠️ Location enhancement failed with primary model, trying fallback: {e}", session_id, logging.WARNING)
+        
+        # Try fallback model
+        try:
+            enhanced = fallback_model.generate_content(prompt).text.strip()
+            if enhanced and "," in enhanced:
+                log_with_session(f"✅ Location enhanced with fallback model", session_id)
+                return enhanced
+            return location
+        except Exception as fallback_e:
+            log_with_session(f"❌ Location enhancement failed with both models: {fallback_e}", session_id, logging.ERROR)
+            return location
 
 
 def generate_inception_report(
@@ -866,7 +1027,8 @@ def generate_inception_report(
     output_path: str,
     ocr_file: Optional[str] = None,
     session_id: Optional[str] = None,
-    progress_store: Optional[Dict[str, Dict[str, float]]] = None
+    progress_store: Optional[Dict[str, Dict[str, float]]] = None,
+    stream_callback: Optional[Callable[[str, str], None]] = None
 ) -> bool:
     try:
         def progress_callback(value: float):
@@ -877,12 +1039,12 @@ def generate_inception_report(
 
         # Extract location
         if ocr_file and Path(ocr_file).exists():
-            location = extract_location(ocr_file)
-            location = enhance_location(location)  # Added location enhancement
+            location = extract_location(ocr_file, session_id)
+            location = enhance_location(location, session_id)  # Added location enhancement
         else:
             location = "Unspecified location in India"
         
-        logger.info(f"Report location: {location}")
+        log_with_session(f"📍 Report location: {location}", session_id)
         progress_callback(10.0)
 
         # Load classified data
@@ -891,7 +1053,7 @@ def generate_inception_report(
             with open(classified_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception as e:
-            logger.error(f"Failed to load classified file: {e}")
+            log_with_session(f"❌ Failed to load classified file: {e}", session_id, logging.ERROR)
             return False
 
         # Parse categories
@@ -908,7 +1070,7 @@ def generate_inception_report(
         progress_callback(15.0)
 
         # Generate sections
-        generator = ContentGenerator(location, progress_callback=progress_callback)
+        generator = ContentGenerator(location, progress_callback=progress_callback, session_id=session_id, stream_callback=stream_callback)
         
         section_categories = [
             "executive_summary", "introduction", "site_appreciation", "methodology",
@@ -946,13 +1108,28 @@ def generate_inception_report(
         image_base_dir = classified_path.parent
 
         image_json_path = image_base_dir / "classified_images.json"
+
         if image_json_path.exists():
             try:
                 with open(image_json_path, "r", encoding="utf-8") as f:
-                    image_data = json.load(f)
-                logger.info(f"Loaded {len(image_data)} images from {image_json_path}")
+                    raw_data = json.load(f)
+                
+                # Extract the list of image entries
+                if isinstance(raw_data, dict) and "images" in raw_data:
+                    image_data = raw_data["images"]
+                elif isinstance(raw_data, list):
+                    # Fallback if old format was used
+                    image_data = raw_data
+                else:
+                    image_data = []
+                    log_with_session("⚠️ Unexpected format in classified_images.json", session_id, logging.WARNING)
+
+                log_with_session(f"📸 Loaded {len(image_data)} images from {image_json_path}", session_id)
             except Exception as e:
-                logger.warning(f"Failed to load image data: {e}")
+                log_with_session(f"⚠️ Failed to load image data: {e}", session_id, logging.WARNING)
+                image_data = []
+        else:
+            image_data = []
 
         # Create PDF with images
         create_pdf_report(
@@ -960,16 +1137,16 @@ def generate_inception_report(
             location, 
             output_path, 
             image_data=image_data, 
-            image_base_dir=str(image_base_dir)
+            image_base_dir=str(image_base_dir),
+            session_id=session_id
         )
         
         progress_callback(100.0)
-        logger.info(f"✓ Inception report generated successfully: {output_path}")
-        
+        log_with_session(f"✅ Inception report generated successfully: {output_path}", session_id)
         return True
 
     except Exception as e:
-        logger.error(f"Report generation failed: {e}", exc_info=True)
+        log_with_session(f"❌ Report generation failed: {e}", session_id, logging.ERROR)
         return False
 
 

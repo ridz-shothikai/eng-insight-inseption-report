@@ -5,21 +5,38 @@ import time
 import logging
 from io import BytesIO
 from pathlib import Path
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, Callable 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 from pdf2image import convert_from_path
 from pdf2image.pdf2image import pdfinfo_from_path
 from PIL import Image
+from src.utils.log_streamer import log_streamer, SessionLogHandler
 
 load_dotenv()
 
+# Setup logger with session handler
 logger = logging.getLogger(__name__)
 
+# Add session log handler if not already added
+if not any(isinstance(h, SessionLogHandler) for h in logger.handlers):
+    session_log_handler = SessionLogHandler(log_streamer)
+    session_log_handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    ))
+    logger.addHandler(session_log_handler)
+
+# Helper function for session-aware logging
+def log_with_session(message: str, session_id: str = None, level=logging.INFO):
+    """Helper to log with session context for streaming"""
+    if session_id:
+        logger.log(level, message, extra={'session_id': session_id})
+    else:
+        logger.log(level, message)
 
 # Global function for multiprocessing (must be at module level)
-def process_single_page_worker(page_data: Tuple[int, Image.Image], api_key: str) -> Tuple[int, str]:
+def process_single_page_worker(page_data: Tuple[int, Image.Image], api_key: str, session_id: str = None) -> Tuple[int, str]:
     """
     Worker function for processing a single page with Google Cloud Vision API
     
@@ -57,7 +74,7 @@ def process_single_page_worker(page_data: Tuple[int, Image.Image], api_key: str)
                 # Handle rate limiting
                 if response.status_code == 429:
                     sleep_time = 2 ** attempt
-                    logger.warning(f"Rate limited on page {page_num}. Waiting {sleep_time}s...")
+                    log_with_session(f"⏱️ Rate limited on page {page_num}. Waiting {sleep_time}s...", session_id, logging.WARNING)
                     time.sleep(sleep_time)
                     continue
                 
@@ -72,14 +89,14 @@ def process_single_page_worker(page_data: Tuple[int, Image.Image], api_key: str)
                 
             except Exception as e:
                 if attempt == max_retries - 1:
-                    logger.error(f"Failed page {page_num} after {max_retries} attempts: {e}")
+                    log_with_session(f"❌ Failed page {page_num} after {max_retries} attempts: {e}", session_id, logging.ERROR)
                     return page_num, ""
                 time.sleep(2 ** attempt)
         
         return page_num, ""
         
     except Exception as e:
-        logger.error(f"Error processing page {page_num}: {e}")
+        log_with_session(f"❌ Error processing page {page_num}: {e}", session_id, logging.ERROR)
         return page_num, ""
 
 
@@ -91,7 +108,8 @@ class GoogleCloudVisionOCR:
         api_key: Optional[str] = None,
         max_workers: Optional[int] = None,
         dpi: int = 200,
-        chunk_size: int = 50
+        chunk_size: int = 50,
+        session_id: str = None
     ):
         """
         Initialize Google Cloud Vision OCR processor
@@ -109,11 +127,13 @@ class GoogleCloudVisionOCR:
         self.max_workers = max_workers or int(os.getenv("MAX_WORKERS", 10))
         self.dpi = dpi
         self.chunk_size = chunk_size
+        self.session_id = session_id 
         self.session = requests.Session()
         
-        logger.info(
+        log_with_session(
             f"Google Cloud Vision OCR initialized: "
-            f"{self.max_workers} workers, DPI={dpi}, chunk_size={chunk_size}"
+            f"{self.max_workers} workers, DPI={dpi}, chunk_size={chunk_size}",
+            session_id
         )
     
     def process_pdf(self, pdf_path: str, progress_callback=None) -> str:
@@ -130,19 +150,19 @@ class GoogleCloudVisionOCR:
         pdf_path = Path(pdf_path)
         
         if not pdf_path.exists():
-            logger.error(f"PDF file not found: {pdf_path}")
+            log_with_session(f"❌ PDF file not found: {pdf_path}", self.session_id, logging.ERROR)
             return ""
         
-        logger.info(f"Processing PDF: {pdf_path}")
+        log_with_session(f"Processing PDF: {pdf_path}", self.session_id)
         start_time = time.time()
         
         # Get total page count
         try:
             info = pdfinfo_from_path(str(pdf_path))
             total_pages = info["Pages"]
-            logger.info(f"PDF has {total_pages} pages")
+            log_with_session(f"PDF has {total_pages} pages", self.session_id)
         except Exception as e:
-            logger.error(f"Could not read PDF info: {e}")
+            log_with_session(f"❌ Could not read PDF info: {e}", self.session_id, logging.ERROR)
             return ""
         
         results = {}
@@ -153,7 +173,7 @@ class GoogleCloudVisionOCR:
             end_page = min(start_page + self.chunk_size - 1, total_pages)
             chunk_pages = end_page - start_page + 1
             
-            logger.info(f"Converting pages {start_page}-{end_page} to images...")
+            log_with_session(f"Converting pages {start_page}-{end_page} to images...", self.session_id)
             chunk_start = time.time()
             
             try:
@@ -167,17 +187,17 @@ class GoogleCloudVisionOCR:
                 )
                 
                 conversion_time = time.time() - chunk_start
-                logger.info(f"Chunk conversion took {conversion_time:.2f}s")
+                log_with_session(f"Chunk conversion took {conversion_time:.2f}s", self.session_id)
                 
                 # Prepare page data
                 page_data = [(start_page + i, page) for i, page in enumerate(pages)]
                 
                 # Process chunk in parallel
-                logger.info(f"Processing {len(pages)} pages with {self.max_workers} workers...")
+                log_with_session(f"Processing {len(pages)} pages with {self.max_workers} workers...", self.session_id)
                 
                 with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                     futures = {
-                        executor.submit(process_single_page_worker, data, self.api_key): data[0]
+                        executor.submit(process_single_page_worker, data, self.api_key, self.session_id): data[0]  
                         for data in page_data
                     }
                     
@@ -188,10 +208,7 @@ class GoogleCloudVisionOCR:
                             results[result_page_num] = text
                             pages_processed += 1
                             
-                            logger.info(
-                                f"Completed page {result_page_num}/{total_pages} "
-                                f"({pages_processed}/{total_pages} total)"
-                            )
+                            log_with_session(f"✓ Completed page {result_page_num}/{total_pages}...", self.session_id)
                             
                             # Update progress
                             if progress_callback:
@@ -199,7 +216,7 @@ class GoogleCloudVisionOCR:
                                 progress_callback(progress_value)
                                 
                         except Exception as e:
-                            logger.error(f"Page {page_num} generated exception: {e}")
+                            log_with_session(f"❌ Page {page_num} generated exception: {e}", self.session_id, logging.ERROR)
                             results[page_num] = ""
                             pages_processed += 1
                 
@@ -207,10 +224,10 @@ class GoogleCloudVisionOCR:
                 del pages
                 
                 chunk_time = time.time() - chunk_start
-                logger.info(f"Chunk {start_page}-{end_page} completed in {chunk_time:.2f}s")
+                log_with_session(f"Chunk {start_page}-{end_page} completed in {chunk_time:.2f}s", self.session_id)
                 
             except Exception as e:
-                logger.error(f"Failed to process chunk {start_page}-{end_page}: {e}")
+                log_with_session(f"❌ Failed to process chunk {start_page}-{end_page}: {e}", self.session_id, logging.ERROR)
                 # Mark failed pages as empty
                 for page_num in range(start_page, end_page + 1):
                     if page_num not in results:
@@ -224,10 +241,7 @@ class GoogleCloudVisionOCR:
             full_text += f"\n--- Page {i} ---\n{page_text}\n"
         
         total_time = time.time() - start_time
-        logger.info(
-            f"OCR complete! Total time: {total_time:.2f}s, "
-            f"Speed: {total_pages/total_time:.2f} pages/sec"
-        )
+        log_with_session(f"✅ OCR complete! Total time: {total_time:.2f}s...", self.session_id)
         
         # Mark as complete
         if progress_callback:
@@ -249,18 +263,18 @@ class GoogleCloudVisionOCR:
         image_path = Path(image_path)
         
         if not image_path.exists():
-            logger.error(f"Image file not found: {image_path}")
+            log_with_session(f"❌ Image file not found: {image_path}", self.session_id, logging.ERROR)
             return ""
         
         try:
             if progress_callback:
                 progress_callback(50.0)
             
-            logger.info(f"Processing image: {image_path}")
+            log_with_session(f"🖼️ Processing image: {image_path}", self.session_id)
             
             # Load and process image
             image = Image.open(image_path)
-            _, text = process_single_page_worker((1, image), self.api_key)
+            _, text = process_single_page_worker((1, image), self.api_key, self.session_id)
             
             if progress_callback:
                 progress_callback(100.0)
@@ -268,7 +282,7 @@ class GoogleCloudVisionOCR:
             return f"\n--- Image: {image_path.name} ---\n{text}\n"
             
         except Exception as e:
-            logger.error(f"Error processing image {image_path}: {e}")
+            log_with_session(f"❌ Error processing image {image_path}: {e}", self.session_id, logging.ERROR)
             return ""
     
     def process_document(self, input_path: str, output_path: str, progress_callback=None) -> bool:
@@ -288,11 +302,12 @@ class GoogleCloudVisionOCR:
             output_path = Path(output_path)
             
             if not input_path.exists():
-                logger.error(f"Input file not found: {input_path}")
+                log_with_session(f"❌ Input file not found: {input_path}", self.session_id, logging.ERROR)
                 return False
             
             file_ext = input_path.suffix.lower()
-            logger.info(f"Starting OCR for {input_path.name} (type: {file_ext})")
+            log_with_session(f"📄 Starting OCR for {input_path.name} (type: {file_ext})", self.session_id)
+
             
             # Route to appropriate processor
             if file_ext == ".pdf":
@@ -300,7 +315,7 @@ class GoogleCloudVisionOCR:
             elif file_ext in [".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp"]:
                 text = self.process_image_file(str(input_path), progress_callback)
             else:
-                logger.error(f"Unsupported file type: {file_ext}")
+                log_with_session(f"❌ Unsupported file type: {file_ext}", self.session_id, logging.ERROR)
                 return False
             
             # Save output
@@ -308,16 +323,18 @@ class GoogleCloudVisionOCR:
             with open(output_path, "w", encoding="utf-8") as f:
                 f.write(text)
             
-            logger.info(f"OCR complete for {input_path.name}, saved to {output_path}")
+            log_with_session(f"✅ OCR complete for {input_path.name}, saved to {output_path}", self.session_id)
             return True
             
         except Exception as e:
-            logger.error(f"OCR failed: {e}", exc_info=True)
+            log_with_session(f"❌ OCR failed: {e}", self.session_id, logging.ERROR)
             return False
     
     def cleanup(self):
         """Cleanup resources"""
         self.session.close()
+
+    
 
 
 # Integration function for backend (FastAPI compatible)
@@ -347,12 +364,14 @@ def process_ocr(
             progress_store[session_id]["ocr"] = value
     
     try:
-        ocr = GoogleCloudVisionOCR(api_key=api_key)
+        log_with_session(f"🔍 Starting OCR processing", session_id)
+        ocr = GoogleCloudVisionOCR(api_key=api_key, session_id=session_id)
         success = ocr.process_document(input_path, output_path, progress_callback)
         ocr.cleanup()
+        log_with_session(f"✅ OCR processing complete", session_id)
         return success
     except Exception as e:
-        logger.error(f"OCR process failed: {e}")
+        log_with_session(f"❌ OCR process failed: {e}", session_id, logging.ERROR)
         return False
 
 

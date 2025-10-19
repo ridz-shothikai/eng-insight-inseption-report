@@ -137,7 +137,7 @@ def get_route_image(
     end_lat: float, 
     end_lng: float, 
     size: str = "1920x1080"
-) -> Optional[Image.Image]:
+) -> Optional[Tuple[Optional[Image.Image], Optional[str]]]:
     """Generate route map image using Google Static Maps API"""
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
@@ -161,24 +161,24 @@ def get_route_image(
             "path": f"color:0x0000ff|weight:5|{path}",
             "key": api_key
         }
+
+        base_url = "https://maps.googleapis.com/maps/api/staticmap"
+        query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+        route_image_url = f"{base_url}?{query_string}"
         
-        resp = requests.get(
-            "https://maps.googleapis.com/maps/api/staticmap",
-            params=params,
-            timeout=30
-        )
+        resp = requests.get(route_image_url, timeout=30)
         
         if resp.status_code == 200:
             logger.info(f"Route map image generated successfully")
             img = Image.open(BytesIO(resp.content))
-            return img
+            return img, route_image_url  # Return both image and URL
         else:
             logger.warning(f"Failed to fetch route image: {resp.status_code}")
-            return None
+            return None, None
     
     except Exception as e:
         logger.error(f"Error generating route image: {e}")
-        return None
+        return None, None
 
 
 # ---------------- Image Classifier ---------------- #
@@ -192,9 +192,15 @@ class ImageClassifier:
             raise ValueError("GOOGLE_API_KEY not found in environment variables")
         
         genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel("gemini-2.5-flash")
         
-        logger.info("ImageClassifier initialized with Gemini model")
+        # Primary and fallback models
+        self.primary_model_name = "gemini-2.5-flash-lite"
+        self.fallback_model_name = "gemini-2.5-flash-lite"
+        
+        self.model = genai.GenerativeModel(self.primary_model_name)
+        self.fallback_model = genai.GenerativeModel(self.fallback_model_name)
+        
+        logger.info(f"ImageClassifier initialized with {self.primary_model_name} (fallback: {self.fallback_model_name})")
     
     def _load_image_for_classification(self, image_path: str) -> Optional[Image.Image]:
         """Load and prepare image for API"""
@@ -261,68 +267,92 @@ Caption:"""
     
     def classify_image(self, image_path: str, max_retries: int = 3) -> str:
         """
-        Classify a single image
+        Classify a single image into one of the predefined categories with fallback support
         
         Args:
             image_path: Path to the image file
-            max_retries: Maximum number of retry attempts
+            max_retries: Maximum number of retry attempts per model
             
         Returns:
             Category name as string
         """
         img = self._load_image_for_classification(image_path)
         if not img:
-            logger.warning(f"Could not load image, defaulting to 'site_appreciation'")
-            return "site_appreciation"
+            logger.warning(f"Could not load image for classification")
+            return "uncategorized"
         
         prompt = self._build_classification_prompt()
         
+        # Try primary model first
         for attempt in range(max_retries):
             try:
-                # Add delay to respect rate limits
                 time.sleep(1)
-                
-                # Generate classification
                 response = self.model.generate_content([prompt, img])
                 category = response.text.strip().lower()
-                
-                # Clean up response
-                category = category.replace('"', '').replace("'", "").strip()
                 
                 # Validate category
                 if category in IMAGE_CATEGORIES:
                     logger.info(f"✓ Classified: {Path(image_path).name} → {category}")
                     return category
                 else:
-                    logger.warning(f"Invalid category '{category}', trying again...")
-                    if attempt < max_retries - 1:
-                        time.sleep(2)
-                        continue
-                    else:
-                        logger.warning(f"Max retries reached, defaulting to 'site_appreciation'")
-                        return "site_appreciation"
-                
+                    logger.warning(f"Invalid category '{category}', using closest match")
+                    # Try to find closest match
+                    for valid_cat in IMAGE_CATEGORIES.keys():
+                        if valid_cat in category or category in valid_cat:
+                            return valid_cat
+                    return "uncategorized"
+                    
             except Exception as e:
                 if "429" in str(e) or "quota" in str(e).lower():
                     wait_time = 30 * (attempt + 1)
-                    logger.warning(f"Rate limited. Waiting {wait_time}s... (attempt {attempt + 1})")
+                    logger.warning(f"Rate limited on {self.primary_model_name}. Waiting {wait_time}s... (attempt {attempt + 1})")
                     time.sleep(wait_time)
                 else:
-                    logger.error(f"Classification error: {e}")
+                    logger.error(f"Classification error on {self.primary_model_name}: {e}")
                     if attempt < max_retries - 1:
                         time.sleep(5)
-                    else:
-                        return "site_appreciation"
         
-        return "site_appreciation"
+        # Fallback to weaker model
+        logger.warning(f"⚠️ Primary model failed, trying fallback: {self.fallback_model_name}")
+        
+        for attempt in range(max_retries):
+            try:
+                time.sleep(1)
+                response = self.fallback_model.generate_content([prompt, img])
+                category = response.text.strip().lower()
+                
+                # Validate category
+                if category in IMAGE_CATEGORIES:
+                    logger.info(f"✓ Classified with fallback: {Path(image_path).name} → {category}")
+                    return category
+                else:
+                    logger.warning(f"Invalid category '{category}', using closest match")
+                    for valid_cat in IMAGE_CATEGORIES.keys():
+                        if valid_cat in category or category in valid_cat:
+                            return valid_cat
+                    return "uncategorized"
+                    
+            except Exception as e:
+                if "429" in str(e) or "quota" in str(e).lower():
+                    wait_time = 30 * (attempt + 1)
+                    logger.warning(f"Rate limited on {self.fallback_model_name}. Waiting {wait_time}s... (attempt {attempt + 1})")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Classification error on {self.fallback_model_name}: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(5)
+        
+        # Ultimate fallback
+        logger.warning(f"All models failed for classification")
+        return "uncategorized"
     
     def generate_caption(self, image_path: str, max_retries: int = 3) -> str:
         """
-        Generate a caption for a single image
+        Generate a caption for a single image with fallback support
         
         Args:
             image_path: Path to the image file
-            max_retries: Maximum number of retry attempts
+            max_retries: Maximum number of retry attempts per model
             
         Returns:
             Caption text as string
@@ -334,18 +364,13 @@ Caption:"""
         
         prompt = self._build_caption_prompt()
         
+        # Try primary model first
         for attempt in range(max_retries):
             try:
-                # Add delay to respect rate limits
                 time.sleep(1)
-                
-                # Generate caption
                 response = self.model.generate_content([prompt, img])
                 caption = response.text.strip()
-                
-                # Clean up response - remove quotes and common prefixes
-                caption = caption.replace('"', '').replace("'", "").strip()
-                caption = caption.replace("Caption:", "").strip()
+                caption = caption.replace('"', '').replace("'", "").replace("Caption:", "").strip()
                 
                 logger.info(f"✓ Caption generated: {Path(image_path).name} → {caption}")
                 return caption
@@ -353,15 +378,38 @@ Caption:"""
             except Exception as e:
                 if "429" in str(e) or "quota" in str(e).lower():
                     wait_time = 30 * (attempt + 1)
-                    logger.warning(f"Rate limited. Waiting {wait_time}s... (attempt {attempt + 1})")
+                    logger.warning(f"Rate limited on {self.primary_model_name}. Waiting {wait_time}s... (attempt {attempt + 1})")
                     time.sleep(wait_time)
                 else:
-                    logger.error(f"Caption generation error: {e}")
+                    logger.error(f"Caption generation error on {self.primary_model_name}: {e}")
                     if attempt < max_retries - 1:
                         time.sleep(5)
-                    else:
-                        return "Image description unavailable"
         
+        # Fallback to weaker model
+        logger.warning(f"⚠️ Primary model failed, trying fallback: {self.fallback_model_name}")
+        
+        for attempt in range(max_retries):
+            try:
+                time.sleep(1)
+                response = self.fallback_model.generate_content([prompt, img])
+                caption = response.text.strip()
+                caption = caption.replace('"', '').replace("'", "").replace("Caption:", "").strip()
+                
+                logger.info(f"✓ Caption generated with fallback: {Path(image_path).name} → {caption}")
+                return caption
+                
+            except Exception as e:
+                if "429" in str(e) or "quota" in str(e).lower():
+                    wait_time = 30 * (attempt + 1)
+                    logger.warning(f"Rate limited on {self.fallback_model_name}. Waiting {wait_time}s... (attempt {attempt + 1})")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Caption generation error on {self.fallback_model_name}: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(5)
+        
+        # Ultimate fallback
+        logger.warning(f"All models failed for caption generation")
         return "Image description unavailable"
 
 
@@ -391,6 +439,14 @@ def add_metadata_to_image(
         # Convert to RGB if necessary
         if img.mode != 'RGB':
             img = img.convert('RGB')
+
+        # Standardize image size (pad to 1920x1080)
+        img = ImageOps.pad(
+            img,
+            (2560, 1440),
+            method=Image.Resampling.LANCZOS,
+            color=(255, 255, 255)  # White background for padding
+        )
         
         # Simply save the image without any overlay
         img.save(output_path, quality=95)
@@ -429,11 +485,12 @@ def process_images(
         
         # --- Generate route map if coordinates provided ---
         all_image_paths = list(image_paths)  # Start with user images
+        route_image_url = None 
         
         if coordinate_data and "start" in coordinate_data and "end" in coordinate_data:
             start = coordinate_data["start"]
             end = coordinate_data["end"]
-            route_img = get_route_image(
+            route_img, route_image_url = get_route_image(  # Now returns both image and URL
                 start["latitude"], start["longitude"],
                 end["latitude"], end["longitude"]
             )
@@ -455,6 +512,13 @@ def process_images(
                 route_img.save(route_image_path, quality=95)
                 all_image_paths.insert(0, str(route_image_path))  # Process first
                 logger.info(f"Route map saved: {route_image_path}")
+
+                # Store the route URL in a separate file
+                if route_image_url:
+                    route_url_path = output_path / "route_image_url.txt"
+                    with open(route_url_path, 'w') as f:
+                        f.write(route_image_url)
+                    logger.info(f"Route URL saved: {route_url_path}")
             else:
                 logger.warning("Failed to generate route map")
         
@@ -513,10 +577,14 @@ def process_images(
             logger.info(f"Session {session_id}: Image {idx + 1}/{total_to_process} processed")
             logger.info(f"  Category: {category}")
             logger.info(f"  Caption: {caption}")
+
+        result_data = {
+            "images": processed_results,
+            "route_image_url": route_image_url  # Add route URL to results
+        }
         
-        # Save classification results
         with open(classified_images_json_path, 'w', encoding='utf-8') as f:
-            json.dump(processed_results, f, indent=2, ensure_ascii=False)
+            json.dump(result_data, f, indent=2, ensure_ascii=False)
         
         logger.info(f"Session {session_id}: All images processed. Results saved to {classified_images_json_path}")
         logger.info(f"Session {session_id}: Processed images saved to {output_dir}")

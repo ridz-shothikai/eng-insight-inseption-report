@@ -39,3 +39,9 @@ Pillow
 opencv-python
 polyline
 
+#streaming
+sse-starlette
+
+#testing
+pytest
+

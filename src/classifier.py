@@ -98,10 +98,16 @@ class ContentClassifier:
             raise ValueError("GOOGLE_API_KEY not found in .env")
         
         genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel("gemini-2.5-flash")
+        
+        # Primary and fallback models
+        self.primary_model_name = "gemini-2.5-flash-lite"
+        self.fallback_model_name = "gemini-2.5-flash-lite"
+        
+        self.model = genai.GenerativeModel(self.primary_model_name)
+        self.fallback_model = genai.GenerativeModel(self.fallback_model_name)
         self.progress_callback = progress_callback
         
-        logger.info("ContentClassifier initialized with Gemini AI")
+        logger.info(f"ContentClassifier initialized with {self.primary_model_name} (fallback: {self.fallback_model_name})")
 
     def update_progress(self, value: float):
         """Update progress via callback if available"""
@@ -133,30 +139,91 @@ Text to classify:
 
 Respond with a JSON array of category names. Return ONLY the JSON array, no explanations."""
 
-    async def _classify_chunk(self, chunk: TextChunk) -> Set[str]:
-        """Classify a single chunk using Gemini; fallback to keywords"""
-        try:
-            prompt = self._build_prompt(chunk.text)
-            response = await asyncio.to_thread(self.model.generate_content, prompt)
-            resp_text = response.text.strip()
-
-            # Try to parse JSON array
-            import re
+    async def _classify_chunk(self, chunk: TextChunk, max_retries: int = 2) -> Set[str]:
+        """Classify a single chunk using Gemini with fallback; ultimate fallback to keywords"""
+        
+        prompt = self._build_prompt(chunk.text)
+        
+        # Try primary model first
+        for attempt in range(max_retries):
             try:
-                if resp_text.startswith('[') and resp_text.endswith(']'):
-                    categories = json.loads(resp_text)
+                response = await asyncio.to_thread(self.model.generate_content, prompt)
+                resp_text = response.text.strip()
+
+                # Try to parse JSON array
+                import re
+                try:
+                    if resp_text.startswith('[') and resp_text.endswith(']'):
+                        categories = json.loads(resp_text)
+                    else:
+                        match = re.search(r'\[.*\]', resp_text, re.DOTALL)
+                        categories = json.loads(match.group()) if match else []
+                except Exception:
+                    categories = []
+
+                valid = {c for c in categories if c in self.CATEGORIES}
+                if valid:
+                    return valid
+                
+                # If no valid categories, try again
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                    continue
+                    
+            except Exception as e:
+                if "429" in str(e) or "quota" in str(e).lower() or "rateLimit" in str(e):
+                    wait_time = 10 * (attempt + 1)
+                    logger.warning(f"Rate limited on {self.primary_model_name} for chunk {chunk.chunk_id}. Waiting {wait_time}s... (attempt {attempt + 1})")
+                    await asyncio.sleep(wait_time)
                 else:
-                    match = re.search(r'\[.*\]', resp_text, re.DOTALL)
-                    categories = json.loads(match.group()) if match else []
-            except Exception:
-                categories = []
+                    logger.warning(f"Primary model error for chunk {chunk.chunk_id}: {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2)
+                    else:
+                        break
+        
+        # Fallback to weaker model
+        logger.warning(f"⚠️ Primary model failed for chunk {chunk.chunk_id}, trying fallback: {self.fallback_model_name}")
+        
+        for attempt in range(max_retries):
+            try:
+                response = await asyncio.to_thread(self.fallback_model.generate_content, prompt)
+                resp_text = response.text.strip()
 
-            valid = {c for c in categories if c in self.CATEGORIES}
-            return valid if valid else self._fallback_classification(chunk.text)
+                # Try to parse JSON array
+                import re
+                try:
+                    if resp_text.startswith('[') and resp_text.endswith(']'):
+                        categories = json.loads(resp_text)
+                    else:
+                        match = re.search(r'\[.*\]', resp_text, re.DOTALL)
+                        categories = json.loads(match.group()) if match else []
+                except Exception:
+                    categories = []
 
-        except Exception as e:
-            logger.warning(f"Gemini classification failed for chunk {chunk.chunk_id}, using fallback: {e}")
-            return self._fallback_classification(chunk.text)
+                valid = {c for c in categories if c in self.CATEGORIES}
+                if valid:
+                    logger.info(f"✓ Classified chunk {chunk.chunk_id} with fallback model")
+                    return valid
+                
+                # If no valid categories, try again
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                    continue
+                    
+            except Exception as e:
+                if "429" in str(e) or "quota" in str(e).lower() or "rateLimit" in str(e):
+                    wait_time = 10 * (attempt + 1)
+                    logger.warning(f"Rate limited on {self.fallback_model_name} for chunk {chunk.chunk_id}. Waiting {wait_time}s... (attempt {attempt + 1})")
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.warning(f"Fallback model error for chunk {chunk.chunk_id}: {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2)
+        
+        # Ultimate fallback to keyword-based classification
+        logger.warning(f"All models failed for chunk {chunk.chunk_id}, using keyword fallback")
+        return self._fallback_classification(chunk.text)
 
     async def classify_chunks(self, chunks: List[TextChunk], concurrency: int = 5) -> Dict[str, List[TextChunk]]:
         """
