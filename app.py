@@ -27,7 +27,6 @@ from src.utils.validators import validate_coordinates
 from src.utils.log_streamer import log_streamer, SessionLogHandler
 
 #Import Mongodb packages
-
 from src.database.mongodb import mongodb, get_database
 from src.database.crud import session_crud, markdown_crud, file_crud
 from bson import ObjectId
