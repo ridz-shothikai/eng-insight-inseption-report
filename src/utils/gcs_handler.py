@@ -16,7 +16,7 @@ load_dotenv(PROJECT_ROOT / '.env')
 logger = logging.getLogger(__name__)
 
 class GCSHandler:
-    def __init__(self, bucket_name: str = "eng-inception"):
+    def __init__(self, bucket_name: str = None):
         """Initialize GCS client and bucket"""
         credentials_path = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
         if credentials_path and not os.path.isabs(credentials_path):
@@ -25,9 +25,12 @@ class GCSHandler:
             os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = credentials_path
         
         self.client = storage.Client()
-        self.bucket_name = bucket_name
-        self.bucket = self.client.bucket(bucket_name)
-        logger.info(f"✅ GCS Handler initialized for bucket: {bucket_name}")
+        
+        # ✅ Read bucket name from .env if not provided
+        self.bucket_name = bucket_name or os.getenv('GCS_BUCKET_NAME', 'eng-inception')
+        
+        self.bucket = self.client.bucket(self.bucket_name)
+        logger.info(f"✅ GCS Handler initialized for bucket: {self.bucket_name}")
     
     def upload_file(self, local_path: str, gcs_path: str) -> str:
         """Upload a file to GCS and return the GCS URI"""
