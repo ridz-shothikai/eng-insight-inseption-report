@@ -1,3 +1,4 @@
+# src/models/session_models.py
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from bson import ObjectId
@@ -21,11 +22,14 @@ class PyObjectId(ObjectId):
 
 class SessionBase(BaseModel):
     session_id: str
+    session_name: str  #for user-friendly names
     created_at: datetime = Field(default_factory=datetime.now)
-    status: str = "processing"  # processing, completed, failed
+    updated_at: datetime = Field(default_factory=datetime.now) 
+    status: str = "processing"  # processing, completed, failed, cloned, merged
     progress: Dict[str, float] = Field(default_factory=dict)
     coordinate_data: Dict[str, Any]
-    original_files: Dict[str, List[str]]
+    original_files: Dict[str, Any]  # Changed from List[str] to Any to support both string and list
+    error: Optional[str] = None  # ADD THIS - for storing error messages
 
 class SessionCreate(SessionBase):
     pass
@@ -48,6 +52,6 @@ class MarkdownSection(BaseModel):
 class ProcessedFile(BaseModel):
     session_id: str
     file_type: str  # ocr, chunked, classified, inception, etc.
-    file_path: str
+    gcs_path: str  
     file_size: int
     created_at: datetime = Field(default_factory=datetime.now)

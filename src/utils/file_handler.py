@@ -1,4 +1,4 @@
-# utils/file_handler.py
+# src/utils/file_handler.py
 import json
 import time
 from pathlib import Path
@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Union
 import logging
 
 logger = logging.getLogger(__name__)
-
 
 def cleanup_old_files(directory: Union[str, Path], days: int = 7) -> int:
     """
@@ -41,7 +40,6 @@ def cleanup_old_files(directory: Union[str, Path], days: int = 7) -> int:
         logger.error(f"Error during cleanup of {directory}: {e}")
         return deleted_count
 
-
 def ensure_directories(directories: List[Union[str, Path]]) -> None:
     """
     Ensure all directories in the list exist, create if they don't.
@@ -58,10 +56,12 @@ def ensure_directories(directories: List[Union[str, Path]]) -> None:
 # JSON File Utilities
 # -----------------------------
 def load_json(file_path: Union[str, Path]) -> Dict:
+    """Load JSON file and return as dictionary"""
     file_path = Path(file_path)
     if not file_path.exists():
         logger.warning(f"JSON file not found: {file_path}")
         return {}
+    
     try:
         with file_path.open("r", encoding="utf-8") as f:
             data = json.load(f)
@@ -71,8 +71,10 @@ def load_json(file_path: Union[str, Path]) -> Dict:
         return {}
 
 def save_json(data: Any, file_path: Union[str, Path], indent: int = 2):
+    """Save data as JSON file"""
     file_path = Path(file_path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
+    
     try:
         with file_path.open("w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=indent)
@@ -80,15 +82,16 @@ def save_json(data: Any, file_path: Union[str, Path], indent: int = 2):
     except Exception as e:
         logger.error(f"Failed to save JSON file {file_path}: {e}")
 
-
 # -----------------------------
 # Text File Utilities
 # -----------------------------
 def read_text(file_path: Union[str, Path]) -> str:
+    """Read text file and return content"""
     file_path = Path(file_path)
     if not file_path.exists():
         logger.warning(f"Text file not found: {file_path}")
         return ""
+    
     try:
         with file_path.open("r", encoding="utf-8") as f:
             return f.read()
@@ -97,8 +100,10 @@ def read_text(file_path: Union[str, Path]) -> str:
         return ""
 
 def write_text(content: str, file_path: Union[str, Path]):
+    """Write content to text file"""
     file_path = Path(file_path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
+    
     try:
         with file_path.open("w", encoding="utf-8") as f:
             f.write(content)

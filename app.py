@@ -930,6 +930,7 @@ async def clone_session(session_id: str, new_session_id: str = None):
         # Create cloned session data
         cloned_session = original_session.copy()
         cloned_session["session_id"] = new_session_id
+        cloned_session["session_name"] = f"{new_session_id}_clone"
         cloned_session["status"] = "cloned"
         cloned_session["progress"] = {"completed": 0.0}  # Reset progress
         cloned_session["created_at"] = datetime.now()
@@ -1009,6 +1010,7 @@ async def merge_sessions(session_ids: List[str], new_session_id: str = None):
         # Create merged session data
         merged_session = {
             "session_id": new_session_id,
+            "session_name": new_session_id,
             "status": "merged",
             "progress": {"completed": 100.0},  # Mark as completed since we're merging existing data
             "coordinate_data": source_sessions[0].get("coordinate_data", {}),  # Use first session's coordinates

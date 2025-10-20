@@ -142,7 +142,7 @@ def get_route_image(
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
         logger.error("Google API key not configured")
-        return None
+        return None, None
     
     try:
         route_coords, distance, duration = get_route_from_google(
@@ -155,23 +155,31 @@ def get_route_image(
         markers_start = f"color:green|label:A|{start_lat},{start_lng}"
         markers_end = f"color:red|label:B|{end_lat},{end_lng}"
         
+        # BETTER FIX: Let Google auto-fit by NOT specifying center/zoom
+        # Instead, add visible parameter to ensure good padding
         params = {
             "size": size,
             "markers": [markers_start, markers_end],
             "path": f"color:0x0000ff|weight:5|{path}",
+            "visible": f"{start_lat},{start_lng}|{end_lat},{end_lng}",  # ADD THIS
             "key": api_key
         }
+        
+        # Remove center and zoom - let Google calculate from visible points
 
         base_url = "https://maps.googleapis.com/maps/api/staticmap"
-        query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+        query_string = "&".join([
+            f"{k}={'|'.join(v) if isinstance(v, list) else v}" 
+            for k, v in params.items()
+        ])
         route_image_url = f"{base_url}?{query_string}"
         
         resp = requests.get(route_image_url, timeout=30)
         
         if resp.status_code == 200:
-            logger.info(f"Route map image generated successfully")
+            logger.info(f"Route map image generated successfully (distance: {distance:.2f}km)")
             img = Image.open(BytesIO(resp.content))
-            return img, route_image_url  # Return both image and URL
+            return img, route_image_url
         else:
             logger.warning(f"Failed to fetch route image: {resp.status_code}")
             return None, None
@@ -179,8 +187,7 @@ def get_route_image(
     except Exception as e:
         logger.error(f"Error generating route image: {e}")
         return None, None
-
-
+    
 # ---------------- Image Classifier ---------------- #
 
 class ImageClassifier:
@@ -512,13 +519,6 @@ def process_images(
                 route_img.save(route_image_path, quality=95)
                 all_image_paths.insert(0, str(route_image_path))  # Process first
                 logger.info(f"Route map saved: {route_image_path}")
-
-                # Store the route URL in a separate file
-                if route_image_url:
-                    route_url_path = output_path / "route_image_url.txt"
-                    with open(route_url_path, 'w') as f:
-                        f.write(route_image_url)
-                    logger.info(f"Route URL saved: {route_url_path}")
             else:
                 logger.warning("Failed to generate route map")
         

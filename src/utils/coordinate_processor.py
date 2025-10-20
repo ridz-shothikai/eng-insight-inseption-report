@@ -1,4 +1,4 @@
-# utils/coordinate_processor.py
+# src/utils/coordinate_processor.py
 import math
 from typing import Tuple, List, Dict
 
