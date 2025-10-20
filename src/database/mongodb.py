@@ -5,7 +5,7 @@ from pymongo import MongoClient
 import logging
 from dotenv import load_dotenv
 
-# Load .env from project root - more robust path resolution
+# Load .env from project root 
 project_root = Path(__file__).parent.parent.parent  # Go up one more level
 dotenv_path = project_root / ".env"
 

@@ -49,3 +49,10 @@ pytest
 pymongo
 motor
 
+#GCS
+google-cloud-storage
+google-auth
+google-auth-oauthlib 
+google-auth-httplib2
+google-api-python-client
+
