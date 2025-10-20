@@ -120,12 +120,12 @@ class FileCRUD:
             self._processed_files = self.db.processed_files
         return self._processed_files
     
-    async def save_file_metadata(self, session_id: str, file_type: str, file_path: str, file_size: int):
+    async def save_file_metadata(self, session_id: str, file_type: str, gcs_path: str, file_size: int):
         """Save processed file metadata"""
         await self.processed_files.insert_one({
             "session_id": session_id,
             "file_type": file_type,
-            "file_path": file_path,
+            "gcs_path": gcs_path,  # Store GCS path instead of local path
             "file_size": file_size,
             "created_at": datetime.now()
         })

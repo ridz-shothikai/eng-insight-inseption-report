@@ -32,6 +32,9 @@ from src.database.crud import session_crud, markdown_crud, file_crud
 from bson import ObjectId
 import json
 
+#Import GCS
+from src.utils.gcs_handler import gcs_handler
+
 # ---------------------------
 # Logging setup
 # ---------------------------
@@ -84,16 +87,10 @@ app.add_middleware(
 # Directories
 # ---------------------------
 BASE_DIR = Path(__file__).resolve().parent
-UPLOAD_DIR = BASE_DIR / "uploads"
-OUTPUT_DIR = BASE_DIR / "outputs"
-RFP_UPLOAD_DIR = UPLOAD_DIR / "rfp_documents"
-IMAGE_UPLOAD_DIR = UPLOAD_DIR / "user_images"
+TEMP_DIR = BASE_DIR / "temp"  # For temporary processing only
 
 ensure_directories([
-    UPLOAD_DIR,
-    OUTPUT_DIR,
-    RFP_UPLOAD_DIR,
-    IMAGE_UPLOAD_DIR,
+    TEMP_DIR,
     BASE_DIR / "logs"
 ])
 
@@ -163,6 +160,7 @@ async def create_indexes():
     await db.sessions.create_index("session_id", unique=True)
     await db.sessions.create_index("created_at")
     await db.sessions.create_index("status")
+    await db.sessions.create_index("session_name") 
     
     # Markdown indexes
     await db.markdown_sections.create_index([("session_id", 1), ("section_id", 1)], unique=True)
@@ -174,26 +172,27 @@ async def create_indexes():
     
     logger.info("✅ MongoDB indexes created")
 
-
 # ---------------------------
 # Startup & Shutdown events
 # ---------------------------
 @app.on_event("startup")
 async def startup_event():
     logger.info("Starting RFP Processing API...")
-
+    
     # Connect to MongoDB
     await mongodb.connect()
-
+    
     # Create indexes
     await create_indexes()
-
-    cleanup_old_files(OUTPUT_DIR, days=7)
-    cleanup_old_files(UPLOAD_DIR, days=7)
+    
+    # Clean up temp directory on startup (in case of previous crashes)
+    cleanup_old_files(TEMP_DIR, days=1)  # Clean temp files older than 1 day
     
     # Start background tasks
     asyncio.create_task(cleanup_old_progress())
-    asyncio.create_task(cleanup_old_history()) 
+    asyncio.create_task(cleanup_old_history())
+    asyncio.create_task(cleanup_old_temp_files())  # New task for temp cleanup
+    asyncio.create_task(cleanup_old_gcs_sessions())  # Optional: cleanup old GCS sessions
 
 async def cleanup_old_progress():
     """Cleanup completed sessions from progress_store after 1 hour"""
@@ -214,6 +213,7 @@ async def cleanup_old_progress():
         
         for session_id in to_remove:
             progress_store.pop(session_id, None)
+            markdown_store.pop(session_id, None)  # Also clean markdown store
             logger.info(f"Cleaned up old progress for session: {session_id}")
 
 async def cleanup_old_history():
@@ -226,6 +226,53 @@ async def cleanup_old_history():
                 logger.info(f"Cleaned up history for {removed} old sessions")
         except Exception as e:
             logger.error(f"Error cleaning up history: {e}")
+
+async def cleanup_old_temp_files():
+    """Cleanup orphaned temp files every hour"""
+    while True:
+        await asyncio.sleep(3600)  # Run every hour
+        try:
+            cleanup_old_files(TEMP_DIR, days=1)  # Remove temp files older than 1 day
+            logger.info("Cleaned up old temp files")
+        except Exception as e:
+            logger.error(f"Error cleaning up temp files: {e}")
+
+async def cleanup_old_gcs_sessions():
+    """Optional: Cleanup old GCS sessions (e.g., older than 30 days)"""
+    while True:
+        await asyncio.sleep(86400)  # Run once per day
+        try:
+            current_time = datetime.now()
+            cutoff_days = 30  # Keep sessions for 30 days
+            
+            # Get all sessions from MongoDB
+            sessions = await session_crud.get_all_sessions(limit=1000)
+            
+            deleted_count = 0
+            for session in sessions:
+                session_id = session.get("session_id")
+                created_at = session.get("created_at")
+                
+                if created_at and (current_time - created_at).days > cutoff_days:
+                    try:
+                        # Delete from GCS
+                        gcs_handler.delete_folder(f"sessions/{session_id}/")
+                        
+                        # Delete from MongoDB
+                        await session_crud.delete_session(session_id)
+                        await markdown_crud.delete_session_markdown(session_id)
+                        await file_crud.delete_session_files(session_id)
+                        
+                        deleted_count += 1
+                        logger.info(f"Deleted old session: {session_id}")
+                    except Exception as e:
+                        logger.error(f"Error deleting session {session_id}: {e}")
+            
+            if deleted_count > 0:
+                logger.info(f"🗑️ Cleaned up {deleted_count} old GCS sessions (>{cutoff_days} days)")
+                
+        except Exception as e:
+            logger.error(f"Error in GCS cleanup task: {e}")
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -282,28 +329,21 @@ async def process_rfp(
         log_with_session(f"✓ Validation passed: {len(images)} images, coordinates validated", session_id)
 
         # ---------------------------
-        # Directories
+        # Upload files directly to GCS (no local directories needed)
         # ---------------------------
-        session_upload_dir = RFP_UPLOAD_DIR / session_id
-        session_image_dir = IMAGE_UPLOAD_DIR / session_id
-        session_output_dir = OUTPUT_DIR / session_id
-        processed_images_dir = session_output_dir / "processed_images"
-        ensure_directories([session_upload_dir, session_image_dir, session_output_dir, processed_images_dir])
 
-        # Save RFP
-        rfp_path = session_upload_dir / rfp_document.filename
-        with open(rfp_path, "wb") as f:
-            shutil.copyfileobj(rfp_document.file, f)
-        log_with_session(f"📄 Saved RFP document: {rfp_document.filename}", session_id)
+        # Upload RFP document to GCS
+        rfp_gcs_path = f"sessions/{session_id}/rfp/{rfp_document.filename}"
+        gcs_handler.upload_fileobj(rfp_document.file, rfp_gcs_path)
+        log_with_session(f"📄 Uploaded RFP document to GCS: {rfp_document.filename}", session_id)
 
-        # Save images
-        image_paths = []
+        # Upload images to GCS
+        image_gcs_paths = []
         for idx, image in enumerate(images):
-            img_path = session_image_dir / f"{idx}_{image.filename}"
-            with open(img_path, "wb") as f:
-                shutil.copyfileobj(image.file, f)
-            image_paths.append(img_path)
-        log_with_session(f"📸 Saved {len(images)} images", session_id)
+            img_gcs_path = f"sessions/{session_id}/images/{idx}_{image.filename}"
+            gcs_handler.upload_fileobj(image.file, img_gcs_path)
+            image_gcs_paths.append(img_gcs_path)
+        log_with_session(f"📸 Uploaded {len(images)} images to GCS", session_id)
 
         # ---------------------------
         # Initialize progress
@@ -329,6 +369,7 @@ async def process_rfp(
         # ---------------------------
         session_data = {
             "session_id": session_id,
+            "session_name": session_id,
             "status": "processing",
             "progress": {
                 "ocr": 0.0, "images": 0.0, "chunking": 0.0, 
@@ -339,8 +380,8 @@ async def process_rfp(
                 "end": {"latitude": end_latitude, "longitude": end_longitude}
             },
             "original_files": {
-                "rfp": [rfp_document.filename],
-                "images": [img.filename for img in images]
+                "rfp": rfp_gcs_path,  # Store GCS path
+                "images": image_gcs_paths  # Store GCS paths
             },
             "created_at": datetime.now(),
             "updated_at": datetime.now()
@@ -350,20 +391,12 @@ async def process_rfp(
         session_db_id = await session_crud.create_session(session_data)
         logger.info(f"✅ Session created in MongoDB with ID: {session_db_id}")
 
-        # ---------------------------
-        # Start processing in background
-        # ---------------------------
+        # Start background processing with GCS paths
         asyncio.create_task(process_rfp_background(
             session_id=session_id,
-            rfp_path=rfp_path,
-            image_paths=image_paths,
-            coordinate_data=coordinate_data,
-            ocr_output_path=session_output_dir / "ocr_output.txt",
-            classified_images_json_path=session_output_dir / "classified_images.json",
-            chunked_output_path=session_output_dir / "chunked_output.json",
-            classified_output_path=session_output_dir / "classified_output.json",
-            inception_pdf_path=session_output_dir / "inception.pdf",
-            processed_images_dir=processed_images_dir
+            rfp_gcs_path=rfp_gcs_path,
+            image_gcs_paths=image_gcs_paths,
+            coordinate_data=coordinate_data
         ))
 
         # ---------------------------
@@ -387,6 +420,7 @@ async def process_rfp(
         try:
             error_session_data = {
                 "session_id": session_id,
+                "session_name": session_id,
                 "status": "failed",
                 "progress": {"completed": -1},
                 "coordinate_data": {
@@ -394,8 +428,8 @@ async def process_rfp(
                     "end": {"latitude": end_latitude, "longitude": end_longitude}
                 },
                 "original_files": {
-                    "rfp": [rfp_document.filename if 'rfp_document' in locals() else "unknown"],
-                    "images": [img.filename for img in images] if 'images' in locals() else []
+                    "rfp": rfp_gcs_path,  # This is a string
+                    "images": image_gcs_paths  # This is a list
                 },
                 "error": str(e),
                 "created_at": datetime.now(),
@@ -412,22 +446,43 @@ async def process_rfp(
 # ---------------------------
 async def process_rfp_background(
     session_id: str,
-    rfp_path: Path,
-    image_paths: List[Path],
-    coordinate_data: Dict,
-    ocr_output_path: Path,
-    classified_images_json_path: Path,
-    chunked_output_path: Path,
-    classified_output_path: Path,
-    inception_pdf_path: Path,
-    processed_images_dir: Path
+    rfp_gcs_path: str,
+    image_gcs_paths: List[str],
+    coordinate_data: Dict
 ):
-    """Background task to process RFP without blocking the main request"""
+    """Background task to process RFP from GCS without blocking the main request"""
+    
+    # Create temp directory for this session
+    temp_session_dir = TEMP_DIR / session_id
+    temp_session_dir.mkdir(parents=True, exist_ok=True)
+    
     try:
         # Start progress logging
         asyncio.create_task(log_progress(session_id))
         
+        log_with_session("📥 Downloading files from GCS for processing", session_id)
+        
+        # Download RFP from GCS to temp location
+        rfp_temp_path = temp_session_dir / "rfp_document.pdf"
+        gcs_handler.download_file(rfp_gcs_path, str(rfp_temp_path))
+        
+        # Download images from GCS to temp location
+        image_temp_paths = []
+        for idx, gcs_path in enumerate(image_gcs_paths):
+            img_temp_path = temp_session_dir / f"image_{idx}.jpg"
+            gcs_handler.download_file(gcs_path, str(img_temp_path))
+            image_temp_paths.append(str(img_temp_path))
+        
         log_with_session("⚡ Running OCR and image processing in parallel", session_id)
+        
+        # Create temp paths for processing outputs
+        ocr_output_path = temp_session_dir / "ocr_output.txt"
+        classified_images_json_path = temp_session_dir / "classified_images.json"
+        chunked_output_path = temp_session_dir / "chunked_output.json"
+        classified_output_path = temp_session_dir / "classified_output.json"
+        inception_pdf_path = temp_session_dir / "inception.pdf"
+        processed_images_dir = temp_session_dir / "processed_images"
+        processed_images_dir.mkdir(exist_ok=True)
 
         # Update progress in MongoDB
         await session_crud.update_session_progress(session_id, {
@@ -437,10 +492,10 @@ async def process_rfp_background(
         
         # Parallel tasks: OCR + Images
         await asyncio.gather(
-            asyncio.to_thread(process_ocr, str(rfp_path), str(ocr_output_path), session_id, progress_store),
+            asyncio.to_thread(process_ocr, str(rfp_temp_path), str(ocr_output_path), session_id, progress_store),
             asyncio.to_thread(
                 process_images,
-                [str(p) for p in image_paths],
+                image_temp_paths,
                 coordinate_data,
                 str(processed_images_dir),
                 str(classified_images_json_path),
@@ -460,19 +515,25 @@ async def process_rfp_background(
         if not processed_images_dir.exists() or not any(processed_images_dir.iterdir()):
             raise Exception("Image processing failed - no images generated")
 
-        # Save file metadata to MongoDB
+        # Upload OCR output to GCS and save metadata
+        log_with_session("📤 Uploading OCR output to GCS", session_id)
         try:
             if ocr_output_path.exists():
+                ocr_gcs_path = f"sessions/{session_id}/outputs/ocr_output.txt"
+                gcs_handler.upload_file(str(ocr_output_path), ocr_gcs_path)
                 await file_crud.save_file_metadata(
-                    session_id, "ocr", str(ocr_output_path), ocr_output_path.stat().st_size
+                    session_id, "ocr", ocr_gcs_path, ocr_output_path.stat().st_size
                 )
+            
             if classified_images_json_path.exists():
+                classified_images_gcs_path = f"sessions/{session_id}/outputs/classified_images.json"
+                gcs_handler.upload_file(str(classified_images_json_path), classified_images_gcs_path)
                 await file_crud.save_file_metadata(
-                    session_id, "classified_images", str(classified_images_json_path), 
+                    session_id, "classified_images", classified_images_gcs_path, 
                     classified_images_json_path.stat().st_size
                 )
         except Exception as e:
-            logger.error(f"Error saving file metadata to MongoDB: {e}")
+            logger.error(f"Error uploading files to GCS or saving metadata: {e}")
 
         log_with_session("✓ Parallel processing completed", session_id)
 
@@ -490,10 +551,12 @@ async def process_rfp_background(
         )
         progress_store[session_id]["chunking"] = 100.0
         
-        # Save chunked file metadata
+        # Upload chunked output to GCS
         if chunked_output_path.exists():
+            chunked_gcs_path = f"sessions/{session_id}/outputs/chunked_output.json"
+            gcs_handler.upload_file(str(chunked_output_path), chunked_gcs_path)
             await file_crud.save_file_metadata(
-                session_id, "chunked", str(chunked_output_path), chunked_output_path.stat().st_size
+                session_id, "chunked", chunked_gcs_path, chunked_output_path.stat().st_size
             )
         
         log_with_session("✓ Text chunking completed", session_id)
@@ -503,10 +566,12 @@ async def process_rfp_background(
         await asyncio.to_thread(classify_chunks, str(chunked_output_path), str(classified_output_path), 5, session_id, progress_store)
         progress_store[session_id]["classification"] = 100.0
         
-        # Save classified file metadata
+        # Upload classified output to GCS
         if classified_output_path.exists():
+            classified_gcs_path = f"sessions/{session_id}/outputs/classified_output.json"
+            gcs_handler.upload_file(str(classified_output_path), classified_gcs_path)
             await file_crud.save_file_metadata(
-                session_id, "classified", str(classified_output_path), classified_output_path.stat().st_size
+                session_id, "classified", classified_gcs_path, classified_output_path.stat().st_size
             )
         
         log_with_session("✓ Chunk classification completed", session_id)
@@ -529,17 +594,26 @@ async def process_rfp_background(
         progress_store[session_id]["report"] = 100.0
         progress_store[session_id]["completed"] = 100.0
         
-        # Save final report metadata
+        # Upload final report to GCS
         if inception_pdf_path.exists():
+            inception_gcs_path = f"sessions/{session_id}/outputs/inception.pdf"
+            gcs_handler.upload_file(str(inception_pdf_path), inception_gcs_path)
             await file_crud.save_file_metadata(
-                session_id, "inception", str(inception_pdf_path), inception_pdf_path.stat().st_size
+                session_id, "inception", inception_gcs_path, inception_pdf_path.stat().st_size
             )
+        
+        # Upload processed images to GCS
+        log_with_session("📤 Uploading processed images to GCS", session_id)
+        for img_file in processed_images_dir.iterdir():
+            if img_file.is_file():
+                img_gcs_path = f"sessions/{session_id}/processed_images/{img_file.name}"
+                gcs_handler.upload_file(str(img_file), img_gcs_path)
         
         # Update final status in MongoDB
         await session_crud.update_session_status(session_id, "completed")
         await session_crud.update_session_progress(session_id, progress_store[session_id])
         
-        log_with_session("✅ Processing complete! Report generated", session_id)
+        log_with_session("✅ Processing complete! Files uploaded to GCS", session_id)
 
     except Exception as e:
         log_with_session(f"❌ Background processing error: {str(e)}", session_id, logging.ERROR)
@@ -548,29 +622,36 @@ async def process_rfp_background(
         # Optionally update progress to indicate failure
         progress_store[session_id]["error"] = str(e)
         progress_store[session_id]["completed"] = -1  # Indicate failure
+    
+    finally:
+        # Clean up temp files
+        if temp_session_dir.exists():
+            shutil.rmtree(temp_session_dir)
+            log_with_session(f"🧹 Cleaned up temp directory", session_id)
 
 
 ############################
-#add image url endpoint
+# add image url endpoint
 ############################
-
 @app.get("/route-url/{session_id}")
 async def get_route_url(session_id: str):
     """Get the Google Maps route image URL for a session"""
     try:
-        # Check if session exists
-        if session_id not in progress_store:
+        # Check if session exists in MongoDB
+        session = await session_crud.get_session(session_id)
+        if not session:
             raise HTTPException(status_code=404, detail="Session not found")
         
-        # Path to the classified images JSON
-        classified_images_path = OUTPUT_DIR / session_id / "classified_images.json"
+        # GCS path to the classified images JSON
+        classified_images_gcs_path = f"sessions/{session_id}/outputs/classified_images.json"
         
-        if not classified_images_path.exists():
+        # Check if file exists in GCS
+        if not gcs_handler.file_exists(classified_images_gcs_path):
             raise HTTPException(status_code=404, detail="Route data not found for this session")
         
-        # Load the JSON data
-        with open(classified_images_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        # Download and load the JSON data from GCS
+        json_content = gcs_handler.download_to_memory(classified_images_gcs_path)
+        data = json.loads(json_content.decode('utf-8'))
         
         # Extract route URL
         route_url = data.get("route_image_url")
@@ -599,9 +680,6 @@ async def get_progress(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
     return progress_store[session_id]
 
-# ---------------------------
-# Download intermediate files
-# ---------------------------
 @app.get("/download/{session_id}/{file_type}")
 async def download_intermediate_file(session_id: str, file_type: str):
     file_mapping = {
@@ -610,10 +688,9 @@ async def download_intermediate_file(session_id: str, file_type: str):
         "classified": "classified_output.json",
         "inception": "inception.pdf",
         "classified_images": "classified_images.json",
-        "processed_images": "processed_images"
+        "processed_images": "processed_images"  # ADD THIS
     }
     
-    # Add media type mapping for proper content type headers
     media_type_mapping = {
         "ocr": "text/plain",
         "chunked": "application/json",
@@ -625,37 +702,26 @@ async def download_intermediate_file(session_id: str, file_type: str):
     if file_type not in file_mapping:
         raise HTTPException(status_code=400, detail="Invalid file type")
     
-    # SPECIAL CASE: For "inception" file type - try session-specific first, then static fallback
-    if file_type == "inception":
-        # First try session-specific file
-        session_file_path = OUTPUT_DIR / session_id / "inception.pdf"
-        if session_file_path.exists():
-            file_path = session_file_path
-        else:
-            # Fallback to static file
-            file_path = BASE_DIR / "inception" / "inception.pdf"
-            if not file_path.exists():
-                raise HTTPException(status_code=404, detail="Inception PDF not found")
-    
-    # For all other file types, use the session-specific files
-    else:
-        file_path = OUTPUT_DIR / session_id / file_mapping[file_type]
-    
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    # Handle directory download (processed images)
-    if file_type == "processed_images" and file_path.is_dir():
-        image_files = [f for f in file_path.iterdir() if f.is_file() and f.suffix.lower() in ['.jpg', '.jpeg', '.png', '.tiff', '.bmp']]
-        
-        if not image_files:
-            raise HTTPException(status_code=404, detail="No processed images found")
-        
-        zip_buffer = BytesIO()
+    # Handle processed_images specially (zip multiple files)
+    if file_type == "processed_images":
         try:
+            # List all processed images from GCS
+            image_prefix = f"sessions/{session_id}/processed_images/"
+            image_files = gcs_handler.list_files(prefix=image_prefix)
+            
+            if not image_files:
+                raise HTTPException(status_code=404, detail="No processed images found")
+            
+            # Create zip in memory
+            zip_buffer = BytesIO()
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                for image_file in image_files:
-                    zip_file.write(image_file, arcname=image_file.name)
+                for gcs_path in image_files:
+                    # Download image from GCS
+                    image_content = gcs_handler.download_to_memory(gcs_path)
+                    # Extract filename from path
+                    filename = gcs_path.split('/')[-1]
+                    # Add to zip
+                    zip_file.writestr(filename, image_content)
             
             zip_buffer.seek(0)
             
@@ -666,20 +732,30 @@ async def download_intermediate_file(session_id: str, file_type: str):
                     "Content-Disposition": f"attachment; filename=processed_images_{session_id}.zip"
                 }
             )
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error creating zip for session {session_id}: {str(e)}")
             raise HTTPException(status_code=500, detail="Error creating download package")
     
-    # Handle single file download with proper media type
-    return FileResponse(
-        path=str(file_path), 
-        filename=file_path.name,  # Use actual file name to handle both session and static files
-        media_type=media_type_mapping.get(file_type, "application/octet-stream"),
-        headers={
-            "Content-Disposition": f"attachment; filename={file_path.name}"
-        }
-    )
-
+    # Handle single file downloads
+    gcs_path = f"sessions/{session_id}/outputs/{file_mapping[file_type]}"
+    
+    if not gcs_handler.file_exists(gcs_path):
+        raise HTTPException(status_code=404, detail="File not found in GCS")
+    
+    try:
+        file_content = gcs_handler.download_to_memory(gcs_path)
+        return StreamingResponse(
+            content=BytesIO(file_content),
+            media_type=media_type_mapping.get(file_type, "application/octet-stream"),
+            headers={
+                "Content-Disposition": f"attachment; filename={file_mapping[file_type]}"
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error downloading from GCS: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error downloading file")
 # ---------------------------
 # Get all sessions endpoint
 # ---------------------------
@@ -758,31 +834,18 @@ async def get_mongo_session(session_id: str):
 
 @app.delete("/sessions/{session_id}")
 async def delete_session(session_id: str):
-    """Delete a session and all its associated data"""
     try:
-        # Check if session exists
         session = await session_crud.get_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
         
-        # Delete session from MongoDB
+        # Delete from MongoDB
         await session_crud.delete_session(session_id)
-        
-        # Delete associated markdown sections
         await markdown_crud.delete_session_markdown(session_id)
-        
-        # Delete associated file metadata
         await file_crud.delete_session_files(session_id)
         
-        # Clean up local files
-        session_dirs = [
-            RFP_UPLOAD_DIR / session_id,
-            IMAGE_UPLOAD_DIR / session_id,
-            OUTPUT_DIR / session_id
-        ]
-        for dir_path in session_dirs:
-            if dir_path.exists():
-                shutil.rmtree(dir_path)
+        # Delete from GCS instead of local files
+        gcs_handler.delete_folder(f"sessions/{session_id}/")
         
         # Clean up in-memory stores
         progress_store.pop(session_id, None)
@@ -1039,6 +1102,58 @@ async def update_session_metadata(
     except Exception as e:
         logger.error(f"Error updating session metadata {session_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error updating session metadata: {str(e)}")
+    
+@app.patch("/sessions/{session_id}/rename")
+async def rename_session(
+    session_id: str,
+    new_name: str = Form(..., description="New name for the session")
+):
+    """Rename an existing session"""
+    try:
+        # Get the session
+        session = await session_crud.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # Sanitize the new name
+        import re
+        sanitized_name = re.sub(r'[^\w\s-]', '', new_name).strip()
+        
+        if not sanitized_name:
+            raise HTTPException(status_code=400, detail="Invalid session name")
+        
+        # Optional: Check if name already exists (if you want unique names)
+        existing = await session_crud.sessions.find_one({
+            "session_name": sanitized_name,
+            "session_id": {"$ne": session_id}  # Exclude current session
+        })
+        if existing:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Session name '{sanitized_name}' already exists"
+            )
+        
+        # Update session name in MongoDB
+        await session_crud.sessions.update_one(
+            {"session_id": session_id},
+            {"$set": {
+                "session_name": sanitized_name,
+                "updated_at": datetime.now()
+            }}
+        )
+        
+        logger.info(f"✏️ Session renamed: {session_id} -> {sanitized_name}")
+        return {
+            "message": "Session renamed successfully",
+            "session_id": session_id,
+            "new_name": sanitized_name
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error renaming session {session_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error renaming session: {str(e)}")
 
 # ---------------------------
 # Log streaming endpoint (SSE)
@@ -1185,28 +1300,31 @@ async def get_markdown(session_id: str):
             "is_complete": is_complete
         }
     }
+
 # ---------------------------
 # Cleanup session files
 # ---------------------------
 @app.delete("/cleanup/{session_id}")
 async def cleanup_session(session_id: str):
     try:
-        session_dirs = [
-            RFP_UPLOAD_DIR / session_id,
-            IMAGE_UPLOAD_DIR / session_id,
-            OUTPUT_DIR / session_id
-        ]
-        for dir_path in session_dirs:
-            if dir_path.exists():
-                shutil.rmtree(dir_path)
+        # Delete session files from GCS
+        gcs_handler.delete_folder(f"sessions/{session_id}/")
+        logger.info(f"🗑️ Deleted GCS files for session: {session_id}")
+        
+        # Clean up any temp files if they exist
+        temp_session_dir = TEMP_DIR / session_id
+        if temp_session_dir.exists():
+            shutil.rmtree(temp_session_dir)
+            logger.info(f"🧹 Cleaned up temp directory for session: {session_id}")
         
         # Clean up in-memory stores
         progress_store.pop(session_id, None)
         markdown_store.pop(session_id, None)
         log_streamer.clear_history(session_id)
         
-        logger.info(f"Cleaned up session: {session_id}")
+        logger.info(f"✅ Cleaned up session: {session_id}")
         return {"message": f"Session {session_id} cleaned up successfully"}
+        
     except Exception as e:
         logger.error(f"Error cleaning up session {session_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Cleanup error: {str(e)}")
