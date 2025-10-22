@@ -821,6 +821,11 @@ async def get_mongo_session(session_id: str):
         session = await session_crud.get_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found in MongoDB")
+        
+        # Convert ObjectId to string for JSON serialization (same as /sessions endpoint)
+        if '_id' in session:
+            session['_id'] = str(session['_id'])
+        
         return session
     except HTTPException:
         raise
