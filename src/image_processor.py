@@ -151,28 +151,21 @@ def get_route_image(
         
         sampled_coords = sample_route_coords(route_coords)
         path = "|".join([f"{lat},{lng}" for lat, lng in sampled_coords])
-        
+
         markers_start = f"color:green|label:A|{start_lat},{start_lng}"
         markers_end = f"color:red|label:B|{end_lat},{end_lng}"
-        
-        # BETTER FIX: Let Google auto-fit by NOT specifying center/zoom
-        # Instead, add visible parameter to ensure good padding
-        params = {
-            "size": size,
-            "markers": [markers_start, markers_end],
-            "path": f"color:0x0000ff|weight:5|{path}",
-            "visible": f"{start_lat},{start_lng}|{end_lat},{end_lng}",  # ADD THIS
-            "key": api_key
-        }
-        
-        # Remove center and zoom - let Google calculate from visible points
 
+        # Build URL with proper multiple markers parameters
         base_url = "https://maps.googleapis.com/maps/api/staticmap"
-        query_string = "&".join([
-            f"{k}={'|'.join(v) if isinstance(v, list) else v}" 
-            for k, v in params.items()
-        ])
-        route_image_url = f"{base_url}?{query_string}"
+        query_parts = [
+            f"size={size}",
+            f"markers={markers_start}",
+            f"markers={markers_end}",
+            f"path=color:0x0000ff|weight:5|{path}",
+            f"visible={start_lat},{start_lng}|{end_lat},{end_lng}",
+            f"key={api_key}"
+        ]
+        route_image_url = f"{base_url}?{'&'.join(query_parts)}"
         
         resp = requests.get(route_image_url, timeout=30)
         
