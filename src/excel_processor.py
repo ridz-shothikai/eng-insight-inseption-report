@@ -16,6 +16,8 @@ import logging
 from dotenv import load_dotenv
 import warnings
 
+from typing import Dict 
+
 warnings.filterwarnings("ignore")
 load_dotenv()
 
@@ -548,54 +550,169 @@ def print_summary(data: List[Dict]):
     print(f"💾 Output format: List of category objects with sheets array")
     print(f"{'='*70}\n")
 
+
+# ============================================================================
+# PIPELINE INTEGRATION FUNCTION
+# ============================================================================
+
+def process_excel(
+    excel_path: str,
+    output_path: str,
+    session_id: Optional[str] = None,
+    progress_store: Optional[Dict] = None
+) -> bool:
+    """
+    Main entry point for Excel processing in the pipeline
+    
+    Args:
+        excel_path: Path to Excel file (.xlsx or .xls)
+        output_path: Path to save excel_classified.json
+        session_id: Optional session ID for logging
+        progress_store: Optional dict to update progress
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        # Log start
+        if session_id:
+            from src.utils.log_streamer import log_streamer
+            log_streamer.broadcast(session_id, "📊 Starting Excel sheet processing")
+        
+        logger.info(f"Excel processing started for: {excel_path}")
+        
+        # Update progress
+        if progress_store and session_id and session_id in progress_store:
+            progress_store[session_id]["excel"] = 10.0
+        
+        # Check if Excel file exists
+        input_path = Path(excel_path)
+        
+        if not input_path.exists():
+            logger.warning(f"Excel file not found: {excel_path}")
+            if session_id:
+                from src.utils.log_streamer import log_streamer
+                log_streamer.broadcast(session_id, "⚠️ Excel file not found, skipping Excel processing")
+            
+            # Create empty output to avoid errors downstream
+            empty_output = []
+            with open(output_path, 'w', encoding='utf-8') as f:
+                json.dump(empty_output, f, indent=2)
+            
+            if progress_store and session_id and session_id in progress_store:
+                progress_store[session_id]["excel"] = 100.0
+            
+            return True
+        
+        if session_id:
+            from src.utils.log_streamer import log_streamer
+            log_streamer.broadcast(session_id, f"📂 Processing Excel file: {input_path.name}")
+        
+        # Update progress
+        if progress_store and session_id and session_id in progress_store:
+            progress_store[session_id]["excel"] = 30.0
+        
+        # Process the Excel file
+        logger.info(f"Processing Excel file: {input_path}")
+        classified_data = process_excel_file(str(input_path), use_llm=True)
+        
+        if not classified_data:
+            logger.error("Excel processing returned no data")
+            if session_id:
+                from src.utils.log_streamer import log_streamer
+                log_streamer.broadcast(session_id, "❌ Excel processing failed")
+            return False
+        
+        # Update progress
+        if progress_store and session_id and session_id in progress_store:
+            progress_store[session_id]["excel"] = 80.0
+        
+        # Save the classified data
+        output_file = save_classified_data(classified_data, output_path)
+        
+        if not output_file or not Path(output_file).exists():
+            logger.error(f"Failed to save Excel classified output to: {output_path}")
+            if session_id:
+                from src.utils.log_streamer import log_streamer
+                log_streamer.broadcast(session_id, "❌ Failed to save Excel output")
+            return False
+        
+        # Final progress update
+        if progress_store and session_id and session_id in progress_store:
+            progress_store[session_id]["excel"] = 100.0
+        
+        if session_id:
+            from src.utils.log_streamer import log_streamer
+            total_sheets = sum(len(item['sheets']) for item in classified_data)
+            log_streamer.broadcast(
+                session_id, 
+                f"✅ Excel processing complete: {len(classified_data)} categories, {total_sheets} sheets"
+            )
+        
+        logger.info(f"✅ Excel processing completed successfully: {output_path}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error in Excel processing: {e}", exc_info=True)
+        if session_id:
+            from src.utils.log_streamer import log_streamer
+            log_streamer.broadcast(session_id, f"❌ Excel processing error: {str(e)}")
+        
+        # Update progress to show failure
+        if progress_store and session_id and session_id in progress_store:
+            progress_store[session_id]["excel"] = -1
+        
+        return False
+
+
 # ============================================================================
 # COMMAND LINE INTERFACE
 # ============================================================================
 
-def main():
-    """Main entry point for command line usage"""
-    parser = argparse.ArgumentParser(
-        description="Classify Excel sheets and clean data with Gemini 2.5 Flash",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Set API key in .env file first
-  # GOOGLE_API_KEY=your-api-key-here
+# def main():
+#     """Main entry point for command line usage"""
+#     parser = argparse.ArgumentParser(
+#         description="Classify Excel sheets and clean data with Gemini 2.5 Flash",
+#         formatter_class=argparse.RawDescriptionHelpFormatter,
+#         epilog="""
+# Examples:
+#   # Set API key in .env file first
+#   # GOOGLE_API_KEY=your-api-key-here
   
-  # Run the classifier
-  python excel_classifier_gemini.py input.xlsx
-  python excel_classifier_gemini.py input.xlsx -o output.json
-  python excel_classifier_gemini.py input.xlsx --no-llm
-        """
-    )
+#   # Run the classifier
+#   python excel_classifier_gemini.py input.xlsx
+#   python excel_classifier_gemini.py input.xlsx -o output.json
+#   python excel_classifier_gemini.py input.xlsx --no-llm
+#         """
+#     )
     
-    parser.add_argument('excel_file', help='Path to Excel file to classify')
-    parser.add_argument('-o', '--output', default='excel_classified.json', help='Output JSON file path')
-    parser.add_argument('--no-llm', action='store_true', help='Use rule-based classification instead of LLM')
+#     parser.add_argument('excel_file', help='Path to Excel file to classify')
+#     parser.add_argument('-o', '--output', default='excel_classified.json', help='Output JSON file path')
+#     parser.add_argument('--no-llm', action='store_true', help='Use rule-based classification instead of LLM')
     
-    args = parser.parse_args()
+#     args = parser.parse_args()
     
-    # Validate API key if using LLM
-    if not args.no_llm:
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            print("❌ Error: GOOGLE_API_KEY not found in environment variables")
-            print("   Create a .env file with: GOOGLE_API_KEY=your-api-key")
-            print("   Or use: --no-llm for rule-based classification")
-            return 1
+#     # Validate API key if using LLM
+#     if not args.no_llm:
+#         api_key = os.getenv("GOOGLE_API_KEY")
+#         if not api_key:
+#             print("❌ Error: GOOGLE_API_KEY not found in environment variables")
+#             print("   Create a .env file with: GOOGLE_API_KEY=your-api-key")
+#             print("   Or use: --no-llm for rule-based classification")
+#             return 1
     
-    use_llm = not args.no_llm
-    classified_data = process_excel_file(args.excel_file, use_llm=use_llm)
+#     use_llm = not args.no_llm
+#     classified_data = process_excel_file(args.excel_file, use_llm=use_llm)
     
-    if classified_data:
-        save_classified_data(classified_data, args.output)
-        print(f"\n✅ Classification complete! Output saved to: {args.output}")
-    else:
-        print("\n❌ Classification failed")
-        return 1
+#     if classified_data:
+#         save_classified_data(classified_data, args.output)
+#         print(f"\n✅ Classification complete! Output saved to: {args.output}")
+#     else:
+#         print("\n❌ Classification failed")
+#         return 1
     
-    return 0
+#     return 0
 
-if __name__ == "__main__":
-    import sys
-    exit(main())
+# if __name__ == "__main__":
+#     import sys
+#     exit(main())

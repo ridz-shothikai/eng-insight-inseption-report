@@ -22,6 +22,7 @@ from src.chunking import chunk_text
 from src.classifier import classify_chunks
 from src.report_generator import generate_inception_report
 from src.image_processor import process_images
+from src.excel_processor import process_excel
 from src.utils.file_handler import cleanup_old_files, ensure_directories
 from src.utils.validators import validate_coordinates
 from src.utils.log_streamer import log_streamer, SessionLogHandler
@@ -99,7 +100,7 @@ ensure_directories([
 # ---------------------------
 progress_store: Dict[str, Dict[str, float]] = {}
 # Structure: progress_store[session_id] = {
-#     "ocr": 0.0, "images": 0.0, "chunking": 0.0, "classification": 0.0,
+#     "ocr": 0.0, "images": 0.0, "excel": 0.0, "chunking": 0.0, "classification": 0.0,
 #     "report": 0.0, "completed": 0.0
 # }
 
@@ -301,6 +302,7 @@ async def log_progress(session_id: str):
 @app.post("/process-rfp")
 async def process_rfp(
     rfp_document: UploadFile = File(..., description="RFP document (PDF/Image)"),
+    excel_file: Optional[UploadFile] = File(None, description="Excel file"),
     start_latitude: float = Form(...),
     start_longitude: float = Form(...),
     end_latitude: float = Form(...),
@@ -325,6 +327,14 @@ async def process_rfp(
         for img in images:
             if img.content_type not in allowed_image_types:
                 raise HTTPException(status_code=400, detail=f"Invalid image type for {img.filename}")
+        # Validate Excel file if provided    
+        if excel_file:
+            allowed_excel_types = [
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # .xlsx
+                "application/vnd.ms-excel"  # .xls
+            ]
+            if excel_file.content_type not in allowed_excel_types:
+                raise HTTPException(status_code=400, detail="Invalid Excel file type. Must be .xlsx or .xls")
 
         log_with_session(f"✓ Validation passed: {len(images)} images, coordinates validated", session_id)
 
@@ -345,12 +355,20 @@ async def process_rfp(
             image_gcs_paths.append(img_gcs_path)
         log_with_session(f"📸 Uploaded {len(images)} images to GCS", session_id)
 
+        # Upload Excel file to GCS if provided
+        excel_gcs_path = None
+        if excel_file:
+            excel_gcs_path = f"sessions/{session_id}/excel/{excel_file.filename}"
+            gcs_handler.upload_fileobj(excel_file.file, excel_gcs_path)
+            log_with_session(f"📊 Uploaded Excel file to GCS: {excel_file.filename}", session_id)
+
         # ---------------------------
         # Initialize progress
         # ---------------------------
         progress_store[session_id] = {
             "ocr": 0.0,
             "images": 0.0,
+            "excel": 0.0,
             "chunking": 0.0,
             "classification": 0.0,
             "report": 0.0,
@@ -381,7 +399,8 @@ async def process_rfp(
             },
             "original_files": {
                 "rfp": rfp_gcs_path,  # Store GCS path
-                "images": image_gcs_paths  # Store GCS paths
+                "images": image_gcs_paths,
+                  "excel": excel_gcs_path  
             },
             "created_at": datetime.now(),
             "updated_at": datetime.now()
@@ -396,6 +415,7 @@ async def process_rfp(
             session_id=session_id,
             rfp_gcs_path=rfp_gcs_path,
             image_gcs_paths=image_gcs_paths,
+            excel_gcs_path=excel_gcs_path,
             coordinate_data=coordinate_data
         ))
 
@@ -448,6 +468,7 @@ async def process_rfp_background(
     session_id: str,
     rfp_gcs_path: str,
     image_gcs_paths: List[str],
+    excel_gcs_path: Optional[str],
     coordinate_data: Dict
 ):
     """Background task to process RFP from GCS without blocking the main request"""
@@ -474,10 +495,18 @@ async def process_rfp_background(
             image_temp_paths.append(str(img_temp_path))
         
         log_with_session("⚡ Running OCR and image processing in parallel", session_id)
+
+        # Download Excel file from GCS if provided
+        excel_temp_path = None
+        if excel_gcs_path:
+            excel_temp_path = temp_session_dir / "excel_file.xlsx"
+            gcs_handler.download_file(excel_gcs_path, str(excel_temp_path))
+            log_with_session(f"📥 Downloaded Excel file from GCS", session_id)
         
         # Create temp paths for processing outputs
         ocr_output_path = temp_session_dir / "ocr_output.txt"
         classified_images_json_path = temp_session_dir / "classified_images.json"
+        excel_classified_path = temp_session_dir / "excel_classified.json"
         chunked_output_path = temp_session_dir / "chunked_output.json"
         classified_output_path = temp_session_dir / "classified_output.json"
         inception_pdf_path = temp_session_dir / "inception.pdf"
@@ -486,7 +515,7 @@ async def process_rfp_background(
 
         # Update progress in MongoDB
         await session_crud.update_session_progress(session_id, {
-            "ocr": 0.0, "images": 0.0, "chunking": 0.0, 
+            "ocr": 0.0, "images": 0.0, "excel": 0.0, "chunking": 0.0, 
             "classification": 0.0, "report": 0.0, "completed": 0.0
         })
         
@@ -536,6 +565,35 @@ async def process_rfp_background(
             logger.error(f"Error uploading files to GCS or saving metadata: {e}")
 
         log_with_session("✓ Parallel processing completed", session_id)
+
+        # Excel Processing (runs AFTER image processing)
+        if excel_temp_path and excel_temp_path.exists():
+            log_with_session("📊 Starting Excel processing", session_id)
+            progress_store[session_id]["excel"] = 0.0
+            
+            await asyncio.to_thread(
+                process_excel,
+                str(excel_temp_path),  # Pass the Excel file path
+                str(excel_classified_path),  # Output path for excel_classified.json
+                session_id,
+                progress_store
+            )
+            progress_store[session_id]["excel"] = 100.0
+            
+            # Upload Excel classified output to GCS
+            if excel_classified_path.exists():
+                excel_classified_gcs_path = f"sessions/{session_id}/outputs/excel_classified.json"
+                gcs_handler.upload_file(str(excel_classified_path), excel_classified_gcs_path)
+                await file_crud.save_file_metadata(
+                    session_id, "excel_classified", excel_classified_gcs_path, 
+                    excel_classified_path.stat().st_size
+                )
+                log_with_session("✓ Excel processing completed", session_id)
+            else:
+                log_with_session("⚠️ Excel processing completed but no output generated", session_id, logging.WARNING)
+        else:
+            log_with_session("⚠️ No Excel file provided, skipping Excel processing", session_id)
+            progress_store[session_id]["excel"] = 100.0  # Mark as complete (skipped)
 
         # Sequential dependent steps
         log_with_session("📝 Starting text chunking", session_id)
@@ -587,6 +645,7 @@ async def process_rfp_background(
             str(classified_output_path),
             str(inception_pdf_path),
             str(ocr_output_path),
+            str(excel_classified_path) if excel_classified_path.exists() else None,
             session_id,
             progress_store,
             stream_callback=markdown_stream_handler

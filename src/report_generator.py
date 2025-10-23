@@ -235,26 +235,57 @@ class ContentGenerator:
         return context
 
     def _get_section_prompt(self, category: str, chunks: List[TextChunk]) -> str:
-        combined_chunks = "\n".join([c.text.strip() for c in chunks if c.text.strip()]) or "No specific project details were provided."
+        # Separate regular and Excel chunks
+        regular_chunks = []
+        excel_chunks = []
+        
+        for c in chunks:
+            if c.text.strip():
+                # Check if this chunk is from Excel (has metadata indicating Excel source)
+                if c.meta and c.meta.get("source") == "excel":
+                    excel_chunks.append(c.text.strip())
+                else:
+                    regular_chunks.append(c.text.strip())
+        
+        # Build combined chunks with clear separation
+        combined_chunks = ""
+        
+        if regular_chunks:
+            combined_chunks += "=== DOCUMENT TEXT DATA ===\n"
+            combined_chunks += "\n\n".join(regular_chunks)
+            combined_chunks += "\n\n"
+        
+        if excel_chunks:
+            combined_chunks += "=== EXCEL SPREADSHEET DATA ===\n"
+            combined_chunks += "Note: The following data is extracted from Excel spreadsheets and contains structured tabular information.\n\n"
+            combined_chunks += "\n\n".join(excel_chunks)
+            combined_chunks += "\n\n"
+        
+        # Fallback if no chunks provided
+        if not combined_chunks.strip():
+            combined_chunks = "No specific project details were provided."
         
         base_guidelines = f"""
-**CRITICAL REQUIREMENTS:**
-- Write ONLY in professional English. NO regional languages.
-- Base ALL content on {self.location}, India.
-- Include technical specifications and tables where relevant.
-- Reference IRC, MoRTH, BIS, NHAI standards.
-- Do NOT invent project-specific facts unless provided.
-- Format content professionally with clear headings and structure.
-"""
+    **CRITICAL REQUIREMENTS:**
+    - Write ONLY in professional English. NO regional languages.
+    - Base ALL content on {self.location}, India.
+    - Include technical specifications and tables where relevant.
+    - Reference IRC, MoRTH, BIS, NHAI standards.
+    - Do NOT invent project-specific facts unless provided.
+    - Format content professionally with clear headings and structure.
+    - When integrating Excel spreadsheet data, preserve the structured/tabular nature where appropriate.
+    - Excel data may contain: project specifications, BOQ items, quantities, schedules, or technical parameters.
+    - Seamlessly integrate spreadsheet data into the narrative without simply copying tables verbatim.
+    """
         
         prompt = f"""Create detailed professional content for the '{category}' section of an RFP inception report.
 
-CLIENT INPUT:
-{combined_chunks}
+    CLIENT INPUT:
+    {combined_chunks}
 
-{base_guidelines}
+    {base_guidelines}
 
-Generate comprehensive, technical content suitable for a professional engineering report."""
+    Generate comprehensive, technical content suitable for a professional engineering report."""
         
         return prompt
 
@@ -1026,6 +1057,7 @@ def generate_inception_report(
     classified_file: str,
     output_path: str,
     ocr_file: Optional[str] = None,
+    excel_classified_file: Optional[str] = None,
     session_id: Optional[str] = None,
     progress_store: Optional[Dict[str, Dict[str, float]]] = None,
     stream_callback: Optional[Callable[[str, str], None]] = None
@@ -1066,6 +1098,49 @@ def generate_inception_report(
                     TextChunk(text=chunk.get("text", "")) 
                     for chunk in chunks if isinstance(chunk, dict)
                 ]
+
+        #Load and merge Excel classified data
+        if excel_classified_file and Path(excel_classified_file).exists():
+            try:
+                with open(excel_classified_file, "r", encoding="utf-8") as f:
+                    excel_data = json.load(f)
+                
+                log_with_session(f"📊 Loading Excel classified data from: {excel_classified_file}", session_id)
+                
+                # Process each category in excel data
+                for excel_item in excel_data:
+                    category = excel_item.get("category", "").strip()
+                    sheets = excel_item.get("sheets", [])
+                    
+                    if not category or not sheets:
+                        continue
+                    
+                    # Create Excel-specific chunks with metadata
+                    excel_chunks = []
+                    for sheet in sheets:
+                        sheet_name = sheet.get("sheet_name", "Unknown Sheet")
+                        content = sheet.get("content", "")
+                        
+                        if content.strip():
+                            # Format the chunk to indicate it's from Excel
+                            formatted_content = f"[EXCEL SHEET: {sheet_name}]\n{content}"
+                            excel_chunks.append(TextChunk(
+                                text=formatted_content,
+                                meta={"source": "excel", "sheet_name": sheet_name}
+                            ))
+                    
+                    # Merge with existing chunks or create new category
+                    if category in categorized_chunks:
+                        categorized_chunks[category].extend(excel_chunks)
+                        log_with_session(f"  ✓ Added {len(excel_chunks)} Excel sheets to existing '{category}' category", session_id)
+                    else:
+                        categorized_chunks[category] = excel_chunks
+                        log_with_session(f"  ✓ Created new '{category}' category with {len(excel_chunks)} Excel sheets", session_id)
+                
+                log_with_session(f"✅ Excel data successfully merged into categorized chunks", session_id)
+                
+            except Exception as e:
+                log_with_session(f"⚠️ Failed to load Excel classified file: {e}", session_id, logging.WARNING)
         
         progress_callback(15.0)
 
