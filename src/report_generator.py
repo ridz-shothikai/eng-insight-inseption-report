@@ -175,7 +175,7 @@ class ContentGenerator:
         genai.configure(api_key=api_key)
         
             # Primary and fallback models
-        self.primary_model_name = "gemini-2.5-flash"
+        self.primary_model_name = "gemini-2.5-flash-lite"
         self.fallback_model_name = "gemini-2.5-flash-lite"  # Weaker/cheaper model
         
         self.model = genai.GenerativeModel(self.primary_model_name)
@@ -974,7 +974,7 @@ def extract_location(input_file: str, session_id: str = None) -> str:
     genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
     
     # Initialize both models
-    primary_model = genai.GenerativeModel("gemini-2.5-flash")
+    primary_model = genai.GenerativeModel("gemini-2.5-flash-lite")
     fallback_model = genai.GenerativeModel("gemini-2.5-flash-lite")
     
     prompt = f"""Extract ONLY the primary city/place from the text for a road/highway/bridge project in India.
@@ -1019,7 +1019,7 @@ def enhance_location(location: str, session_id: str = None) -> str:
     genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
     
     # Initialize both models
-    primary_model = genai.GenerativeModel("gemini-2.5-flash")
+    primary_model = genai.GenerativeModel("gemini-2.5-flash-lite")
     fallback_model = genai.GenerativeModel("gemini-2.5-flash-lite")
     
     prompt = f"""Enhance location into format 'City, District, State' for India.
