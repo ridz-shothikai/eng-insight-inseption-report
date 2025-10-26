@@ -16,10 +16,25 @@ from pdf2image.pdf2image import pdfinfo_from_path
 from PIL import Image
 from src.utils.log_streamer import log_streamer, SessionLogHandler
 
+import threading, time, google.generativeai as genai
+
 load_dotenv()
 
 # Setup logger with session handler
 logger = logging.getLogger(__name__)
+
+# ---------- global free-tier gate ----------
+_RPM_LOCK = threading.Lock()
+_LAST_CALL = 0
+_MIN_INTERVAL = 4.0          # 60 s / 15 requests ≈ 4 s
+
+def _wait_for_free_slot():
+    global _LAST_CALL
+    with _RPM_LOCK:
+        elapsed = time.time() - _LAST_CALL
+        if elapsed < _MIN_INTERVAL:
+            time.sleep(_MIN_INTERVAL - elapsed)
+        _LAST_CALL = time.time()
 
 # Add session log handler if not already added
 if not any(isinstance(h, SessionLogHandler) for h in logger.handlers):
@@ -37,74 +52,53 @@ def log_with_session(message: str, session_id: str = None, level=logging.INFO):
     else:
         logger.log(level, message)
 
-# Global function for multiprocessing (must be at module level)
-def process_single_page_worker(page_data: Tuple[int, Image.Image], api_key: str, session_id: str = None) -> Tuple[int, str]:
-    """
-    Worker function for processing a single page with Google Cloud Vision API
-    
-    Args:
-        page_data: Tuple of (page_number, page_image)
-        api_key: Google Cloud Vision API key
-        
-    Returns:
-        Tuple of (page_number, extracted_text)
-    """
+def process_single_page_worker(
+    page_data: Tuple[int, Image.Image],
+    api_key: str,
+    session_id: str = None
+) -> Tuple[int, str]:
     page_num, page_image = page_data
-    url = f"https://vision.googleapis.com/v1/images:annotate?key={api_key}"
-    
-    try:
-        # Convert image to base64
-        buffered = BytesIO()
-        page_image.save(buffered, format="JPEG", quality=85, optimize=True)
-        img_base64 = base64.b64encode(buffered.getvalue()).decode()
-        
-        payload = {
-            "requests": [
-                {
-                    "image": {"content": img_base64},
-                    "features": [{"type": "DOCUMENT_TEXT_DETECTION"}]
-                }
-            ]
-        }
-        
-        # Retry logic with exponential backoff
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = requests.post(url, json=payload, timeout=30)
-                
-                # Handle rate limiting
-                if response.status_code == 429:
-                    sleep_time = 2 ** attempt
-                    log_with_session(f"⏱️ Rate limited on page {page_num}. Waiting {sleep_time}s...", session_id, logging.WARNING)
-                    time.sleep(sleep_time)
-                    continue
-                
-                response.raise_for_status()
-                data = response.json()
-                
-                text = ""
-                if "responses" in data and len(data["responses"]) > 0:
-                    text = data["responses"][0].get("fullTextAnnotation", {}).get("text", "")
-                
-                return page_num, text.strip()
-                
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    log_with_session(f"❌ Failed page {page_num} after {max_retries} attempts: {e}", session_id, logging.ERROR)
-                    return page_num, ""
-                time.sleep(2 ** attempt)
-        
-        return page_num, ""
-        
-    except Exception as e:
-        log_with_session(f"❌ Error processing page {page_num}: {e}", session_id, logging.ERROR)
-        return page_num, ""
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-2.5-flash-lite")
+
+    buffered = BytesIO()
+    page_image.save(buffered, format="JPEG", quality=85, optimize=True)
+    image_bytes = buffered.getvalue()
+
+    prompt = "Return only the text visible in this document page. Do not add comments."
+
+    for attempt in range(3):
+        try:
+            _wait_for_free_slot()          # ------ rate-limit gate ------
+            response = model.generate_content(
+                [prompt, {"mime_type": "image/jpeg", "data": image_bytes}],
+                request_options={"timeout": 30}
+            )
+            return page_num, (response.text or "").strip()
+
+        except Exception as e:
+            if "429" in str(e):
+                # honour server-side delay once we are above the 15 rpm
+                delay = 60
+                log_with_session(
+                    f"⏱️  429 from Gemini on page {page_num} – waiting {delay}s …",
+                    session_id, logging.WARNING
+                )
+                time.sleep(delay)
+                continue
+            # any other error
+            if attempt == 2:
+                log_with_session(f"❌ Gemini failed on page {page_num}: {e}", session_id, logging.ERROR)
+                return page_num, ""
+            time.sleep(2 ** attempt)
+
+    return page_num, ""
 
 
-class GoogleCloudVisionOCR:
-    """Google Cloud Vision OCR processor optimized for PDFs and images"""
-    
+class GeminiVisionOCR:
+    """Gemini Vision OCR processor optimized for PDFs and images"""
+
     def __init__(
         self, 
         api_key: Optional[str] = None,
@@ -114,17 +108,17 @@ class GoogleCloudVisionOCR:
         session_id: str = None
     ):
         """
-        Initialize Google Cloud Vision OCR processor
+        Initialize Gemini Vision OCR processor
         
         Args:
-            api_key: Google Cloud Vision API key (defaults to env var)
+            api_key: Gemini Vision API key (defaults to env var)
             max_workers: Number of parallel workers (defaults to 10)
             dpi: DPI for PDF to image conversion
             chunk_size: Number of pages to process in each chunk
         """
         self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
         if not self.api_key:
-            raise ValueError("Google Cloud Vision API key not found. Set GOOGLE_API_KEY environment variable.")
+            raise ValueError("Gemini Vision API key not found. Set GOOGLE_API_KEY environment variable.")
         
         self.max_workers = max_workers or int(os.getenv("MAX_WORKERS", 10))
         self.dpi = dpi
@@ -133,14 +127,14 @@ class GoogleCloudVisionOCR:
         self.session = requests.Session()
         
         log_with_session(
-            f"Google Cloud Vision OCR initialized: "
+            f"Gemini Vision OCR initialized: "
             f"{self.max_workers} workers, DPI={dpi}, chunk_size={chunk_size}",
             session_id
         )
     
     def process_pdf(self, pdf_path: str, progress_callback=None) -> str:
         """
-        Process PDF with Google Cloud Vision API in parallel chunks
+        Process PDF with Gemini Vision API in parallel chunks
         
         Args:
             pdf_path: Path to PDF file
@@ -253,7 +247,7 @@ class GoogleCloudVisionOCR:
     
     def process_image_file(self, image_path: str, progress_callback=None) -> str:
         """
-        Process a single image file with Google Cloud Vision API
+        Process a single image file with Gemini Vision API
         
         Args:
             image_path: Path to image file
@@ -367,7 +361,7 @@ def process_ocr(
     
     try:
         log_with_session(f"🔍 Starting OCR processing", session_id)
-        ocr = GoogleCloudVisionOCR(api_key=api_key, session_id=session_id)
+        ocr = GeminiVisionOCR(api_key=api_key, session_id=session_id)
         success = ocr.process_document(input_path, output_path, progress_callback)
         ocr.cleanup()
         log_with_session(f"✅ OCR processing complete", session_id)
