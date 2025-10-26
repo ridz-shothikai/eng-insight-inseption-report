@@ -1,6 +1,6 @@
 # src/utils/validators.py
 
-from typing import Any, List, Dict, Union
+from typing import Any, List, Dict, Union, Optional
 
 # -----------------------------
 # Basic Validators
@@ -31,20 +31,24 @@ def validate_coordinate(lat: float, lng: float) -> bool:
     """Validate single coordinate pair"""
     return -90 <= lat <= 90 and -180 <= lng <= 180
 
-def validate_coordinates(start_lat: float, start_lng: float, 
-                        end_lat: float, end_lng: float) -> bool:
-    """
-    Validate start and end coordinates.
+def validate_coordinates(start_lat: float, start_lng: float, end_lat: float, end_lng: float, waypoint_lats: Optional[List[float]] = None, waypoint_lngs: Optional[List[float]] = None) -> bool:
+    """Validate coordinates including waypoints"""
+    # Validate start and end coordinates (existing logic)
+    if not (-90 <= start_lat <= 90) or not (-180 <= start_lng <= 180):
+        return False
+    if not (-90 <= end_lat <= 90) or not (-180 <= end_lng <= 180):
+        return False
     
-    Args:
-        start_lat, start_lng: Start point coordinates
-        end_lat, end_lng: End point coordinates
+    # Validate waypoints if provided
+    if waypoint_lats and waypoint_lngs:
+        if len(waypoint_lats) != len(waypoint_lngs):
+            return False
+        
+        for lat, lng in zip(waypoint_lats, waypoint_lngs):
+            if not (-90 <= lat <= 90) or not (-180 <= lng <= 180):
+                return False
     
-    Returns:
-        True if all coordinates are valid, False otherwise
-    """
-    return (validate_coordinate(start_lat, start_lng) and 
-            validate_coordinate(end_lat, end_lng))
+    return True
 
 # -----------------------------
 # Combined Checks

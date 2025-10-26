@@ -307,6 +307,8 @@ async def process_rfp(
     start_longitude: float = Form(...),
     end_latitude: float = Form(...),
     end_longitude: float = Form(...),
+    waypoint_latitudes: Optional[List[float]] = Form(None), 
+    waypoint_longitudes: Optional[List[float]] = Form(None),  
     images: List[UploadFile] = File(...),
 ):
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -316,7 +318,9 @@ async def process_rfp(
         # ---------------------------
         # Validation
         # ---------------------------
-        if not validate_coordinates(start_latitude, start_longitude, end_latitude, end_longitude):
+        # Update the validation call
+        
+        if not validate_coordinates(start_latitude, start_longitude, end_latitude, end_longitude, waypoint_latitudes, waypoint_longitudes):
             raise HTTPException(status_code=400, detail="Invalid coordinates provided")
 
         allowed_rfp_types = ["application/pdf", "image/jpeg", "image/png", "image/tiff"]
@@ -379,8 +383,17 @@ async def process_rfp(
 
         coordinate_data = {
             "start": {"latitude": start_latitude, "longitude": start_longitude},
-            "end": {"latitude": end_latitude, "longitude": end_longitude}
+            "end": {"latitude": end_latitude, "longitude": end_longitude},
+            "waypoints": []  # Initialize empty waypoints list
         }
+
+        # Add waypoints if provided
+        if waypoint_latitudes and waypoint_longitudes:
+            for lat, lng in zip(waypoint_latitudes, waypoint_longitudes):
+                coordinate_data["waypoints"].append({
+                    "latitude": lat,
+                    "longitude": lng
+                })
 
         # ---------------------------
         # CREATE SESSION IN MONGODB FIRST (BEFORE BACKGROUND PROCESSING)
@@ -393,10 +406,7 @@ async def process_rfp(
                 "ocr": 0.0, "images": 0.0, "chunking": 0.0, 
                 "classification": 0.0, "report": 0.0, "completed": 0.0
             },
-            "coordinate_data": {
-                "start": {"latitude": start_latitude, "longitude": start_longitude},
-                "end": {"latitude": end_latitude, "longitude": end_longitude}
-            },
+            "coordinate_data": coordinate_data, 
             "original_files": {
                 "rfp": rfp_gcs_path,  # Store GCS path
                 "images": image_gcs_paths,
@@ -443,10 +453,7 @@ async def process_rfp(
                 "session_name": session_id,
                 "status": "failed",
                 "progress": {"completed": -1},
-                "coordinate_data": {
-                    "start": {"latitude": start_latitude, "longitude": start_longitude},
-                    "end": {"latitude": end_latitude, "longitude": end_longitude}
-                },
+                "coordinate_data": coordinate_data,
                 "original_files": {
                     "rfp": rfp_gcs_path,  # This is a string
                     "images": image_gcs_paths  # This is a list

@@ -53,22 +53,55 @@ def calculate_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> fl
     
     return R * c
 
+def sort_waypoints_greedy(start_lat: float, start_lng: float, end_lat: float, end_lng: float, waypoints: List[Dict]) -> List[Dict]:
+    """Greedy algorithm to optimize waypoint order by always choosing the nearest waypoint"""
+    current = (start_lat, start_lng)
+    remaining = waypoints[:]
+    ordered = []
+    
+    while remaining:
+        # Find closest waypoint to current position
+        next_wp = min(
+            remaining,
+            key=lambda wp: calculate_distance(
+                current[0], current[1], wp["latitude"], wp["longitude"]
+            )
+        )
+        ordered.append(next_wp)
+        remaining.remove(next_wp)
+        current = (next_wp["latitude"], next_wp["longitude"])
+    
+    return ordered
+
 
 def get_route_from_google(
     start_lat: float, 
     start_lng: float, 
     end_lat: float, 
-    end_lng: float
+    end_lng: float,
+    waypoints: Optional[List[Dict]] = None,
+    optimize_waypoints: bool = True
 ) -> tuple:
-    """Get route coordinates using Google Routes API"""
+    """Get route coordinates with waypoints using Google Routes API"""
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
         logger.warning("Google API key not found, using fallback straight line")
-        return (
-            [(start_lat, start_lng), (end_lat, end_lng)],
-            calculate_distance(start_lat, start_lng, end_lat, end_lng),
-            0
+        # Fallback with waypoints
+        fallback_coords = [(start_lat, start_lng)]
+        if waypoints:
+            for wp in waypoints:
+                fallback_coords.append((wp["latitude"], wp["longitude"]))
+        fallback_coords.append((end_lat, end_lng))
+        fallback_distance = calculate_distance(start_lat, start_lng, end_lat, end_lng)
+        return fallback_coords, fallback_distance, 0
+    
+    # Apply greedy optimization if requested
+    processed_waypoints = waypoints
+    if optimize_waypoints and waypoints and len(waypoints) > 1:
+        processed_waypoints = sort_waypoints_greedy(
+            start_lat, start_lng, end_lat, end_lng, waypoints
         )
+        logger.info(f"Optimized {len(waypoints)} waypoints using greedy algorithm")
     
     url = "https://routes.googleapis.com/directions/v2:computeRoutes"
     headers = {
@@ -76,6 +109,7 @@ def get_route_from_google(
         "X-Goog-Api-Key": api_key,
         "X-Goog-FieldMask": "routes.distanceMeters,routes.duration,routes.polyline.encodedPolyline"
     }
+    
     body = {
         "origin": {
             "location": {
@@ -92,6 +126,17 @@ def get_route_from_google(
         "polylineQuality": "HIGH_QUALITY"
     }
     
+    # Add waypoints to API request
+    if processed_waypoints:
+        body["intermediates"] = [
+            {
+                "location": {
+                    "latLng": {"latitude": wp["latitude"], "longitude": wp["longitude"]}
+                }
+            }
+            for wp in processed_waypoints
+        ]
+    
     try:
         resp = requests.post(url, json=body, headers=headers, timeout=30)
         resp.raise_for_status()
@@ -104,13 +149,18 @@ def get_route_from_google(
             duration_sec = int(route["duration"].rstrip("s"))
             duration_min = duration_sec / 60
             
-            logger.info(f"Route fetched: {distance:.2f} km, {duration_min:.1f} min")
+            logger.info(f"Route fetched: {distance:.2f} km, {duration_min:.1f} min, {len(processed_waypoints or [])} waypoints")
             return coords, distance, duration_min
     
     except Exception as e:
         logger.warning(f"Google Routes API failed: {e}, using fallback")
     
-    fallback_coords = [(start_lat, start_lng), (end_lat, end_lng)]
+    # Fallback with waypoints
+    fallback_coords = [(start_lat, start_lng)]
+    if processed_waypoints:
+        for wp in processed_waypoints:
+            fallback_coords.append((wp["latitude"], wp["longitude"]))
+    fallback_coords.append((end_lat, end_lng))
     fallback_distance = calculate_distance(start_lat, start_lng, end_lat, end_lng)
     
     return fallback_coords, fallback_distance, 0
@@ -136,9 +186,11 @@ def get_route_image(
     start_lng: float, 
     end_lat: float, 
     end_lng: float, 
-    size: str = "1920x1080"
+    waypoints: Optional[List[Dict]] = None,
+    size: str = "1920x1080",
+    optimize_waypoints: bool = True
 ) -> Optional[Tuple[Optional[Image.Image], Optional[str]]]:
-    """Generate route map image using Google Static Maps API"""
+    """Generate route map image with waypoints using Google Static Maps API"""
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
         logger.error("Google API key not configured")
@@ -146,7 +198,7 @@ def get_route_image(
     
     try:
         route_coords, distance, duration = get_route_from_google(
-            start_lat, start_lng, end_lat, end_lng
+            start_lat, start_lng, end_lat, end_lng, waypoints, optimize_waypoints
         )
         
         sampled_coords = sample_route_coords(route_coords)
@@ -155,22 +207,39 @@ def get_route_image(
         markers_start = f"color:green|label:A|{start_lat},{start_lng}"
         markers_end = f"color:red|label:B|{end_lat},{end_lng}"
 
-        # Build URL with proper multiple markers parameters
+        # Build URL with waypoint markers
         base_url = "https://maps.googleapis.com/maps/api/staticmap"
         query_parts = [
             f"size={size}",
             f"markers={markers_start}",
             f"markers={markers_end}",
+        ]
+        
+        # Add waypoint markers
+        if waypoints:
+            # Use optimized order if optimization is enabled
+            display_waypoints = waypoints
+            if optimize_waypoints and waypoints and len(waypoints) > 1:
+                display_waypoints = sort_waypoints_greedy(start_lat, start_lng, end_lat, end_lng, waypoints)
+            
+            for i, waypoint in enumerate(display_waypoints):
+                wp_lat, wp_lng = waypoint["latitude"], waypoint["longitude"]
+                marker = f"color:blue|label:{i+1}|{wp_lat},{wp_lng}"
+                query_parts.append(f"markers={marker}")
+        
+        # Add route path and final parameters
+        query_parts.extend([
             f"path=color:0x0000ff|weight:5|{path}",
             f"visible={start_lat},{start_lng}|{end_lat},{end_lng}",
             f"key={api_key}"
-        ]
+        ])
+        
         route_image_url = f"{base_url}?{'&'.join(query_parts)}"
         
         resp = requests.get(route_image_url, timeout=30)
         
         if resp.status_code == 200:
-            logger.info(f"Route map image generated successfully (distance: {distance:.2f}km)")
+            logger.info(f"Route map image generated successfully (distance: {distance:.2f}km, {len(waypoints or [])} waypoints)")
             img = Image.open(BytesIO(resp.content))
             return img, route_image_url
         else:
@@ -490,9 +559,12 @@ def process_images(
         if coordinate_data and "start" in coordinate_data and "end" in coordinate_data:
             start = coordinate_data["start"]
             end = coordinate_data["end"]
+            waypoints = coordinate_data.get("waypoints", []) 
             route_img, route_image_url = get_route_image(  # Now returns both image and URL
                 start["latitude"], start["longitude"],
-                end["latitude"], end["longitude"]
+                end["latitude"], end["longitude"],
+                waypoints=waypoints,  # ADD WAYPOINTS PARAMETER
+                optimize_waypoints=True  # ENABLE OPTIMIZATION
             )
             
             if route_img:
@@ -598,20 +670,21 @@ def process_images(
         raise
 
 
-# ---------------- Standalone Usage ---------------- #
-
 # if __name__ == "__main__":
-#     # Example usage
-#     test_images = ["test_image1.jpg", "test_image2.jpg"]
 #     test_coords = {
 #         "start": {"latitude": 23.8103, "longitude": 90.4125},
-#         "end": {"latitude": 23.8203, "longitude": 90.4225}
+#         "end": {"latitude": 23.8203, "longitude": 90.4225},
+#         "waypoints": [
+#             {"latitude": 23.8153, "longitude": 90.4175},
+#             {"latitude": 23.8123, "longitude": 90.4195},
+#             {"latitude": 23.8183, "longitude": 90.4205}
+#         ]
 #     }
-#     
+    
 #     progress = {"test": {"images": 0.0}}
-#     
+    
 #     process_images(
-#         image_paths=test_images,
+#         image_paths=[],  # Empty list = no user images, only route map
 #         coordinate_data=test_coords,
 #         output_dir="processed_images",
 #         classified_images_json_path="classified_images.json",
