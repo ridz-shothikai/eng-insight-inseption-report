@@ -301,7 +301,7 @@ async def log_progress(session_id: str):
 
 @app.post("/process-rfp")
 async def process_rfp(
-    rfp_document: UploadFile = File(..., description="RFP document (PDF/Image)"),
+    rfp_document: UploadFile = File(..., description="RFP document (PDF)"),
     excel_file: Optional[UploadFile] = File(None, description="Excel file"),
     start_latitude: float = Form(...),
     start_longitude: float = Form(...),
@@ -323,7 +323,7 @@ async def process_rfp(
         if not validate_coordinates(start_latitude, start_longitude, end_latitude, end_longitude, waypoint_latitudes, waypoint_longitudes):
             raise HTTPException(status_code=400, detail="Invalid coordinates provided")
 
-        allowed_rfp_types = ["application/pdf", "image/jpeg", "image/png", "image/tiff"]
+        allowed_rfp_types = ["application/pdf"]
         if rfp_document.content_type not in allowed_rfp_types:
             raise HTTPException(status_code=400, detail="Invalid RFP document type")
 
