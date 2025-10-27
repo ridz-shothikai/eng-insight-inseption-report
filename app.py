@@ -313,6 +313,7 @@ async def process_rfp(
 ):
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_with_session("🚀 Starting RFP processing", session_id)
+    logger.info(f"Received route_type: {route_type}")
     
     try:
         # ---------------------------

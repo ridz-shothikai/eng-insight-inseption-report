@@ -218,7 +218,10 @@ def get_route_image(
     
     try:
         route_coords, distance, duration = get_route_from_google(
-            start_lat, start_lng, end_lat, end_lng, waypoints, optimize_waypoints
+            start_lat, start_lng, end_lat, end_lng, 
+            waypoints=waypoints, 
+            optimize_waypoints=optimize_waypoints,
+            route_type=route_type
         )
         
         sampled_coords = sample_route_coords(route_coords)
