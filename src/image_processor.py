@@ -80,9 +80,28 @@ def get_route_from_google(
     end_lat: float, 
     end_lng: float,
     waypoints: Optional[List[Dict]] = None,
-    optimize_waypoints: bool = True
+    optimize_waypoints: bool = True,
+    route_type: str = "existing"
 ) -> tuple:
     """Get route coordinates with waypoints using Google Routes API"""
+
+    if route_type == "new":
+        # For new routes, use straight lines between points
+        coords = [(start_lat, start_lng)]
+        if waypoints:
+            for wp in waypoints:
+                coords.append((wp["latitude"], wp["longitude"]))
+        coords.append((end_lat, end_lng))
+        
+        # Calculate straight-line distance
+        total_distance = 0
+        for i in range(len(coords)-1):
+            total_distance += calculate_distance(
+                coords[i][0], coords[i][1], coords[i+1][0], coords[i+1][1]
+            )
+        
+        return coords, total_distance, total_distance * 2
+
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
         logger.warning("Google API key not found, using fallback straight line")
@@ -188,7 +207,8 @@ def get_route_image(
     end_lng: float, 
     waypoints: Optional[List[Dict]] = None,
     size: str = "1920x1080",
-    optimize_waypoints: bool = True
+    optimize_waypoints: bool = True,
+    route_type: str = "existing" 
 ) -> Optional[Tuple[Optional[Image.Image], Optional[str]]]:
     """Generate route map image with waypoints using Google Static Maps API"""
     api_key = os.getenv("GOOGLE_API_KEY")
@@ -203,6 +223,13 @@ def get_route_image(
         
         sampled_coords = sample_route_coords(route_coords)
         path = "|".join([f"{lat},{lng}" for lat, lng in sampled_coords])
+
+        if route_type == "new":
+            path_color = "color:0xff0000"  # Red for new routes
+            path_style = "weight:8"  # Thicker line
+        else:
+            path_color = "color:0x0000ff"  # Blue for existing routes
+            path_style = "weight:5"
 
         markers_start = f"color:green|label:A|{start_lat},{start_lng}"
         markers_end = f"color:red|label:B|{end_lat},{end_lng}"
@@ -229,7 +256,7 @@ def get_route_image(
         
         # Add route path and final parameters
         query_parts.extend([
-            f"path=color:0x0000ff|weight:5|{path}",
+            f"path={path_color}|{path_style}|{path}",
             f"visible={start_lat},{start_lng}|{end_lat},{end_lng}",
             f"key={api_key}"
         ])
@@ -538,10 +565,14 @@ def process_images(
     session_id: str,
     progress_store: Dict
 ):
+    
     """
     Process images: add metadata, classify them, generate captions, and save as individual image files.
     Also generates and processes a route map image if coordinates are provided.
     """
+    route_type = coordinate_data.get("route_type", "existing")
+    logger.info(f"Processing {route_type} route type")
+
     try:
         logger.info(f"Session {session_id}: Starting image processing")
         
@@ -564,7 +595,8 @@ def process_images(
                 start["latitude"], start["longitude"],
                 end["latitude"], end["longitude"],
                 waypoints=waypoints,  # ADD WAYPOINTS PARAMETER
-                optimize_waypoints=True  # ENABLE OPTIMIZATION
+                optimize_waypoints=True,  # ENABLE OPTIMIZATION
+                route_type=route_type 
             )
             
             if route_img:

@@ -1,6 +1,6 @@
 # main.py
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Header
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
@@ -31,7 +31,6 @@ from src.utils.log_streamer import log_streamer, SessionLogHandler
 from src.database.mongodb import mongodb, get_database
 from src.database.crud import session_crud, markdown_crud, file_crud
 from bson import ObjectId
-import json
 
 #Import GCS
 from src.utils.gcs_handler import gcs_handler
@@ -310,6 +309,7 @@ async def process_rfp(
     waypoint_latitudes: Optional[List[float]] = Form(None), 
     waypoint_longitudes: Optional[List[float]] = Form(None),  
     images: List[UploadFile] = File(...),
+    route_type: str = Header("existing", description="Route type: 'existing' or 'new'")
 ):
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_with_session("🚀 Starting RFP processing", session_id)
@@ -326,6 +326,9 @@ async def process_rfp(
         allowed_rfp_types = ["application/pdf"]
         if rfp_document.content_type not in allowed_rfp_types:
             raise HTTPException(status_code=400, detail="Invalid RFP document type")
+        
+        if route_type not in ["existing", "new"]:
+            raise HTTPException(status_code=400, detail="Invalid route_type in header. Must be 'existing' or 'new'")
 
         allowed_image_types = ["image/jpeg", "image/png", "image/jpg"]
         for img in images:
@@ -384,7 +387,8 @@ async def process_rfp(
         coordinate_data = {
             "start": {"latitude": start_latitude, "longitude": start_longitude},
             "end": {"latitude": end_latitude, "longitude": end_longitude},
-            "waypoints": []  # Initialize empty waypoints list
+            "waypoints": [],  # Initialize empty waypoints list
+            "route_type": route_type 
         }
 
         # Add waypoints if provided

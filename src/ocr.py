@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # ---------- global free-tier gate ----------
 _RPM_LOCK = threading.Lock()
 _LAST_CALL = 0
-_MIN_INTERVAL = 4.0          # 60 s / 15 requests ≈ 4 s
+_MIN_INTERVAL = 0.1  # 600 RPM paid tier = 10 requests/second
 
 def _wait_for_free_slot():
     global _LAST_CALL
@@ -60,7 +60,8 @@ def process_single_page_worker(
     page_num, page_image = page_data
 
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.5-flash-lite")
+    model_name = os.getenv("llm_primary_model", "gemini-2.5-flash-lite")
+    model = genai.GenerativeModel(model_name)
 
     buffered = BytesIO()
     page_image.save(buffered, format="JPEG", quality=85, optimize=True)
@@ -73,14 +74,14 @@ def process_single_page_worker(
             _wait_for_free_slot()          # ------ rate-limit gate ------
             response = model.generate_content(
                 [prompt, {"mime_type": "image/jpeg", "data": image_bytes}],
-                request_options={"timeout": 30}
+                request_options={"timeout": 20}
             )
             return page_num, (response.text or "").strip()
 
         except Exception as e:
             if "429" in str(e):
                 # honour server-side delay once we are above the 15 rpm
-                delay = 60
+                delay = 10
                 log_with_session(
                     f"⏱️  429 from Gemini on page {page_num} – waiting {delay}s …",
                     session_id, logging.WARNING
@@ -91,7 +92,7 @@ def process_single_page_worker(
             if attempt == 2:
                 log_with_session(f"❌ Gemini failed on page {page_num}: {e}", session_id, logging.ERROR)
                 return page_num, ""
-            time.sleep(2 ** attempt)
+            time.sleep(1 ** attempt)
 
     return page_num, ""
 
@@ -179,7 +180,7 @@ class GeminiVisionOCR:
                     dpi=self.dpi,
                     first_page=start_page,
                     last_page=end_page,
-                    thread_count=4
+                    thread_count=8
                 )
                 
                 conversion_time = time.time() - chunk_start

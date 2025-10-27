@@ -99,9 +99,9 @@ class ContentClassifier:
         
         genai.configure(api_key=api_key)
         
-        # Primary and fallback models
-        self.primary_model_name = "gemini-2.5-flash-lite"
-        self.fallback_model_name = "gemini-2.5-flash-lite"
+        # Primary and fallback models from environment variables
+        self.primary_model_name = os.getenv("llm_primary_model", "gemini-2.5-flash-lite")
+        self.fallback_model_name = os.getenv("llm_secondary_model", "gemini-2.5-flash-lite")
         
         self.model = genai.GenerativeModel(self.primary_model_name)
         self.fallback_model = genai.GenerativeModel(self.fallback_model_name)
