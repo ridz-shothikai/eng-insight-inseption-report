@@ -847,7 +847,7 @@ async def download_intermediate_file(session_id: str, file_type: str):
         "classified": "classified_output.json",
         "inception": "inception.pdf",
         "classified_images": "classified_images.json",
-        "processed_images": "processed_images"  # ADD THIS
+        "processed_images": "processed_images" 
     }
     
     media_type_mapping = {

@@ -64,7 +64,7 @@ def process_single_page_worker(
     model = genai.GenerativeModel(model_name)
 
     buffered = BytesIO()
-    page_image.save(buffered, format="JPEG", quality=85, optimize=True)
+    page_image.save(buffered, format="JPEG", quality=75, optimize=True)
     image_bytes = buffered.getvalue()
 
     prompt = "Return only the text visible in this document page. Do not add comments."
@@ -104,7 +104,7 @@ class GeminiVisionOCR:
         self, 
         api_key: Optional[str] = None,
         max_workers: Optional[int] = None,
-        dpi: int = 200,
+        dpi: int = 150,
         chunk_size: int = 50,
         session_id: str = None
     ):
@@ -121,7 +121,7 @@ class GeminiVisionOCR:
         if not self.api_key:
             raise ValueError("Gemini Vision API key not found. Set GOOGLE_API_KEY environment variable.")
         
-        self.max_workers = max_workers or int(os.getenv("MAX_WORKERS", 10))
+        self.max_workers = max_workers or min(8, (os.cpu_count() or 4) * 2) 
         self.dpi = dpi
         self.chunk_size = chunk_size
         self.session_id = session_id 
