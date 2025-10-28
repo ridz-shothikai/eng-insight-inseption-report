@@ -689,13 +689,16 @@ async def process_rfp_background(
 
         log_with_session("🏷️ Starting chunk classification", session_id)
         progress_store[session_id]["classification"] = 0.0
+        
         await asyncio.to_thread(
-            classify_chunks, 
-            str(chunked_output_path), 
-            str(classified_output_path), 
-            5, 
-            session_id, 
-            progress_store
+            classify_chunks,
+            input_path=str(chunked_output_path),
+            output_path=str(classified_output_path),
+            concurrency=100,  
+            session_id=session_id,
+            progress_store=progress_store,
+            batch_size=8,     
+            use_cache=True    
         )
         progress_store[session_id]["classification"] = 100.0
         
