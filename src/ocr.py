@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # ---------- global free-tier gate ----------
 _RPM_LOCK = threading.Lock()
 _LAST_CALL = 0
-_MIN_INTERVAL = 0.1  # 600 RPM paid tier = 10 requests/second
+_MIN_INTERVAL = 0.05  # 600 RPM paid tier = 10 requests/second
 
 def _wait_for_free_slot():
     global _LAST_CALL
@@ -64,7 +64,7 @@ def process_single_page_worker(
     model = genai.GenerativeModel(model_name)
 
     buffered = BytesIO()
-    page_image.save(buffered, format="JPEG", quality=75, optimize=True)
+    page_image.save(buffered, format="JPEG", quality=70, optimize=True)
     image_bytes = buffered.getvalue()
 
     prompt = "Return only the text visible in this document page. Do not add comments."
@@ -105,7 +105,7 @@ class GeminiVisionOCR:
         api_key: Optional[str] = None,
         max_workers: Optional[int] = None,
         dpi: int = 150,
-        chunk_size: int = 50,
+        chunk_size: int = 100,
         session_id: str = None
     ):
         """
