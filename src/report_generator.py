@@ -459,6 +459,21 @@ class ContentGenerator:
 # -----------------------------
 # PDF UTILITIES
 # -----------------------------
+
+
+_ALLOWED_TAGS = ('b', 'i', 'u', 'strong', 'em')
+
+def _escape_unsafe_brackets(text: str) -> str:
+    """
+    Escape every <...> that is NOT a supported ReportLab tag.
+    We do it in one pass with a negative-look-ahead regex.
+    """
+    pattern = re.compile(
+        r'<(?!/?(?:' + '|'.join(_ALLOWED_TAGS) + r')\b)'   # opening bracket NOT followed by allowed tag
+        r'([^>]*)>'                                         # capture everything up to >
+    )
+    return pattern.sub(r'&lt;\1&gt;', text)                # turn <foo> into &lt;foo&gt;
+
 def sanitize_for_reportlab(text: str) -> str:
     """Sanitize text for ReportLab PDF generation"""
     # Convert <br> tags to newlines BEFORE processing
@@ -484,6 +499,8 @@ def sanitize_for_reportlab(text: str) -> str:
     text = text.replace('<u>', '<u>').replace('</u>', '</u>')
     text = text.replace('<strong>', '<b>').replace('</strong>', '</b>')
     text = text.replace('<em>', '<i>').replace('</em>', '</i>')
+
+    text = _escape_unsafe_brackets(text)
     
     return text.strip()
 
