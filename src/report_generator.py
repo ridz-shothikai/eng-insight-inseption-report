@@ -30,6 +30,10 @@ from reportlab.pdfgen import canvas
 # Import log streamer
 from src.utils.log_streamer import log_streamer, SessionLogHandler
 
+#Import concurrency tools
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 # Setup logger with session handler
 logger = logging.getLogger(__name__)
 
@@ -87,7 +91,7 @@ class GoogleSearchTool:
         for attempt in range(max_retries + 1):
             try:
                 time.sleep(0.5)
-                response = requests.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=10)
+                response = requests.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=5)
 
                 if response.status_code == 429:
                     log_with_session(f"Rate limited. Retrying in 30s... (attempt {attempt+1})", self.session_id, logging.WARNING)
@@ -220,17 +224,22 @@ class ContentGenerator:
         queries = self.SEARCH_QUERIES.get(category, [])
         context = f"\n=== EXTERNAL RESEARCH CONTEXT FOR {self.location.upper()} ===\n"
         
-        for query_template in queries:
+        # PARALLEL SEARCH
+        def search_task(query_template):
             query = query_template.format(location=self.location)
             results = self.search_tool.search(query)
             
             if results.get("results"):
-                context += f"\nQuery: {query}\n"
+                result_text = f"\nQuery: {query}\n"
                 for i, r in enumerate(results["results"][:2], 1):
-                    context += f"  {i}. {r.get('snippet', '')}\n"
-            else:
-                context += f"\nQuery: {query} → No results found.\n"
+                    result_text += f"  {i}. {r.get('snippet', '')}\n"
+                return result_text
+            return f"\nQuery: {query} → No results found.\n"
         
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            search_results = list(executor.map(search_task, queries))
+        
+        context += "".join(search_results)
         context += "\n=== END EXTERNAL CONTEXT ===\n"
         return context
 
@@ -293,7 +302,7 @@ class ContentGenerator:
         # Try primary model first
         for attempt in range(max_retries + 1):
             try:
-                time.sleep(1.0)
+                #time.sleep(1.0)
                 full_response = ""
                 
                 response = self.model.generate_content(prompt, stream=True)
@@ -323,7 +332,7 @@ class ContentGenerator:
         
         for attempt in range(max_retries + 1):
             try:
-                time.sleep(1.0)
+                #time.sleep(1.0)
                 full_response = ""
                 
                 response = self.fallback_model.generate_content(prompt, stream=True)
@@ -355,7 +364,7 @@ class ContentGenerator:
         # Try primary model
         for attempt in range(max_retries + 1):
             try:
-                time.sleep(1.0)
+                #time.sleep(1.0)
                 response = self.model.generate_content(prompt)
                 return response.text.strip()
             except Exception as e:
@@ -375,7 +384,7 @@ class ContentGenerator:
         
         for attempt in range(max_retries + 1):
             try:
-                time.sleep(1.0)
+                #time.sleep(1.0)
                 response = self.fallback_model.generate_content(prompt)
                 log_with_session(f"✅ Successfully generated with fallback model: {self.fallback_model_name}", self.session_id)
                 return response.text.strip()
@@ -1077,7 +1086,8 @@ def generate_inception_report(
     excel_classified_file: Optional[str] = None,
     session_id: Optional[str] = None,
     progress_store: Optional[Dict[str, Dict[str, float]]] = None,
-    stream_callback: Optional[Callable[[str, str], None]] = None
+    stream_callback: Optional[Callable[[str, str], None]] = None,
+    max_workers: int = 8
 ) -> bool:
     try:
         def progress_callback(value: float):
@@ -1161,38 +1171,61 @@ def generate_inception_report(
         
         progress_callback(15.0)
 
-        # Generate sections
-        generator = ContentGenerator(location, progress_callback=progress_callback, session_id=session_id, stream_callback=stream_callback)
-        
+        generator = ContentGenerator(location, progress_callback=progress_callback, 
+                                session_id=session_id, stream_callback=stream_callback)
+    
         section_categories = [
             "executive_summary", "introduction", "site_appreciation", "methodology",
             "task_assignment", "cross_sections", "design_standards", "work_programme",
             "development", "quality_assurance", "checklists", "summary_conclusion", "compliances"
         ]
         
-        sections = []
+        # PARALLEL GENERATION
+        sections = [None] * len(section_categories)
         total_sections = len(section_categories) + 5
         
-        for idx, cat in enumerate(section_categories):
+        def generate_section_task(idx, cat):
             chunks = categorized_chunks.get(cat, [TextChunk(text="No input provided.")])
             section = generator.generate_section(cat, chunks)
-            sections.append(section)
-            
             progress = 15.0 + (idx + 1) / total_sections * 70.0
             progress_callback(progress)
-
-        # Generate appendices
+            return idx, section
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(generate_section_task, idx, cat): (idx, cat)
+                for idx, cat in enumerate(section_categories)
+            }
+            
+            for future in as_completed(futures):
+                idx, section = future.result()
+                sections[idx] = section
+        
+        # Similarly for appendices
         appendix_types = [
             "appendix_irc_codes", "appendix_monsoon", "appendix_equipment",
             "appendix_testing", "appendix_compliance_matrix"
         ]
         
-        for idx, appendix_type in enumerate(appendix_types):
+        appendices = [None] * len(appendix_types)
+        
+        def generate_appendix_task(idx, appendix_type):
             appendix = generator.generate_appendix(appendix_type)
-            sections.append(appendix)
-            
             progress = 85.0 + (idx + 1) / len(appendix_types) * 10.0
             progress_callback(progress)
+            return idx, appendix
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(generate_appendix_task, idx, app_type): (idx, app_type)
+                for idx, app_type in enumerate(appendix_types)
+            }
+            
+            for future in as_completed(futures):
+                idx, appendix = future.result()
+                appendices[idx] = appendix
+        
+        sections.extend(appendices)
 
         # Load image data from classified_images.json in the same directory as classified_file
         progress_callback(95.0)

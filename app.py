@@ -728,7 +728,8 @@ async def process_rfp_background(
             str(excel_classified_path) if excel_classified_path.exists() else None,
             session_id,
             progress_store,
-            stream_callback=markdown_stream_handler
+            stream_callback=None,
+            max_workers=8 
         )
         progress_store[session_id]["report"] = 100.0
         progress_store[session_id]["completed"] = 100.0

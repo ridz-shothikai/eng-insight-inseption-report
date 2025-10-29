@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - feat/db
+      - feat/optimize
 
 permissions:
   contents: read
